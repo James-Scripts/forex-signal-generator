@@ -13,20 +13,20 @@ from email.mime.text import MIMEText # Added for email content
 from email.mime.multipart import MIMEMultipart # Added for email structure
 
 
+import os
+# ... (other imports)
+
 # --- API Keys Configuration ---
-# Your Alpha Vantage API key (Free Tier)
-ALPHA_VANTAGE_API_KEY = "LOIS4Y3D1N6PK8LE"
-# Your MarketAux API key (Free Tier)
-MARKETAUX_API_KEY = "L1sPzX2xmOTdE22woWV5Yr1zoSjnRLE0CR1tC58y"
+ALPHA_VANTAGE_API_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY")
+MARKETAUX_API_KEY = os.environ.get("MARKETAUX_API_KEY")
 
 # --- EMAIL Configuration ---
-MAIL_SERVER = 'smtp.gmail.com'
-MAIL_PORT = 465
-MAIL_USE_SSL = True
-MAIL_USERNAME = 'shadowrobot.customer.service@gmail.com'
-MAIL_PASSWORD = 'puhp hqul aeyv jygp' # Note: This is an App Password, not the main account password
-MAIL_SENDER = 'shadowrobot.customer.service@gmail.com'
-MAIL_RECIPIENT = 'jamesnwoke880@gmail.com' # Target Email Address
+MAIL_USERNAME = os.environ.get("MAIL_USERNAME")
+MAIL_PASSWORD = os.environ.get("MAIL_PASSWORD")
+MAIL_SERVER = os.environ.get("MAIL_SERVER", 'smtp.gmail.com')
+MAIL_PORT = int(os.environ.get("MAIL_PORT", 465))
+MAIL_SENDER = os.environ.get("MAIL_SENDER")
+MAIL_RECIPIENT = os.environ.get("MAIL_RECIPIENT")
 
 # --- 0. Email Utility Function ---
 
