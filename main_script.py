@@ -8,13 +8,17 @@ from itertools import product
 from typing import Dict, List, Any, Optional
 from io import StringIO
 import numpy as np
-import smtplib # Added for email sending
-from email.mime.text import MIMEText # Added for email content
-from email.mime.multipart import MIMEMultipart # Added for email structure
-
-
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import os
-# ... (other imports)
+
+# 💡 NEW: Flask Imports
+from flask import Flask, jsonify, request
+from threading import Thread
+
+# --- Flask Application Setup ---
+app = Flask(__name__)
 
 # --- API Keys Configuration ---
 ALPHA_VANTAGE_API_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY")
@@ -32,6 +36,10 @@ MAIL_RECIPIENT = os.environ.get("MAIL_RECIPIENT")
 
 def send_email_notification(subject: str, body: str, recipient: str):
     """Sends an email using the configured SMTP settings."""
+    if not all([MAIL_USERNAME, MAIL_PASSWORD, MAIL_SENDER, recipient]):
+        print("ERROR: Email configuration missing. Skipping email notification.")
+        return
+
     msg = MIMEMultipart()
     msg['From'] = MAIL_SENDER
     msg['To'] = recipient
@@ -69,7 +77,9 @@ class AlphaVantageDataFeed(DataFeed):
     
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.data_cache = {} # Cache for full historical data
+        # 💡 NOTE: In a multi-user or scaled environment, this cache would need to be external (Redis/DB).
+        # For a single background task on Render, a class cache is acceptable.
+        self.data_cache = {} 
 
     def fetch_historical_data(self, symbol: str, interval: str, lookback_years: int) -> pd.DataFrame:
         """
@@ -80,12 +90,13 @@ class AlphaVantageDataFeed(DataFeed):
         
         if symbol in self.data_cache:
             print(f"Historical Data for {symbol} loaded from cache.")
-            return self.data_cache[symbol]
+            return self.data_cache[symbol].copy()
         
+        # 💡 NOTE: The full historical fetching logic is lengthy but preserved here.
+        # Ensure you have a premium Alpha Vantage key to handle 24 slices/month/year.
         print(f"Fetching historical {interval} data for {symbol} (up to 2 years)...")
         
         slices = [f"year{y}month{m}" for y in [1, 2] for m in range(1, 13)]
-        
         all_data = []
         
         for i, slice_name in enumerate(slices):
@@ -460,10 +471,15 @@ class SignalGenerator:
         self.lookback_years = 2
         self.data: Optional[pd.DataFrame] = None
 
-    # ... (initialize_data remains the same) ...
     def initialize_data(self):
         """Fetches historical data to build the model's foundation."""
         print(f"\n--- Initializing Historical Data for {self.symbol} ---")
+        # Ensure API key is present
+        if not self.data_feed.api_key:
+            print("ERROR: Alpha Vantage API Key is missing. Cannot fetch data.")
+            self.data = pd.DataFrame()
+            return
+
         self.data = self.data_feed.fetch_historical_data(self.symbol, self.interval, self.lookback_years)
         
         if self.data is not None and not self.data.empty:
@@ -503,21 +519,33 @@ class SignalGenerator:
             return {"signal": "HOLD", "reason": "Failed to fetch real-time bar."}
 
         # Append new bar and recalculate indicators for the latest point
-        self.data.loc[new_bar.name] = new_bar.copy()
-        self.data.sort_index(inplace=True)
-        self.data['MACDh_12_26_9'] = self.data['close'].ta.macd(fast=self.MACD_FAST, slow=self.MACD_SLOW, signal=self.MACD_SIGNAL, append=False)['MACDh_12_26_9']
-        stoch_results = self.data.ta.stoch(high='high', low='low', close='close', k=self.STOCH_K, d=self.STOCH_D, smooth_k=3, append=False)
-        self.data['STOCHk_14_3_3'] = stoch_results['STOCHk_14_3_3']
-        self.data['STOCHd_14_3_3'] = stoch_results['STOCHd_14_3_3']
+        # This approach ensures indicators are calculated over the full history + new bar
+        temp_data = self.data.copy()
+        temp_data.loc[new_bar.name] = new_bar.copy()
+        temp_data.sort_index(inplace=True)
         
+        # Recalculate MACD and Stochastic on the combined dataset
+        macd_results = temp_data['close'].ta.macd(fast=self.MACD_FAST, slow=self.MACD_SLOW, signal=self.MACD_SIGNAL, append=False)
+        stoch_results = temp_data.ta.stoch(high='high', low='low', close='close', k=self.STOCH_K, d=self.STOCH_D, smooth_k=3, append=False)
+        
+        # Update self.data with the full dataset including the new bar for consistency
+        self.data = temp_data.copy()
+        self.data['MACD_Hist'] = macd_results['MACDh_12_26_9']
+        self.data['Stoch_K'] = stoch_results['STOCHk_14_3_3']
+        self.data['Stoch_D'] = stoch_results['STOCHd_14_3_3']
+        self.data.dropna(subset=['MACD_Hist', 'Stoch_K', 'Stoch_D'], inplace=True)
+
         # Get latest and previous data points
+        if len(self.data) < 2:
+            return {"signal": "HOLD", "reason": "Not enough data points after latest bar append."}
+
         latest_data = self.data.iloc[-1]
         prev_data = self.data.iloc[-2]
         
         latest_close = latest_data['close']
-        latest_macd_hist = latest_data['MACDh_12_26_9']
-        prev_stoch_k = prev_data['STOCHk_14_3_3']
-        prev_stoch_d = prev_data['STOCHd_14_3_3']
+        latest_macd_hist = latest_data['MACD_Hist']
+        prev_stoch_k = prev_data['Stoch_K']
+        prev_stoch_d = prev_data['Stoch_D']
         
         # 2. Fetch Latest Fundamental Score
         print("--- Fetching Real-Time Fundamental Sentiment ---")
@@ -530,14 +558,14 @@ class SignalGenerator:
         # Technical Bias
         macd_bullish = latest_macd_hist > 0
         macd_bearish = latest_macd_hist < 0
-        stoch_bullish_cross = (prev_stoch_k < prev_stoch_d) and (latest_data['STOCHk_14_3_3'] > latest_data['STOCHd_14_3_3']) and (latest_data['STOCHd_14_3_3'] < 50)
-        stoch_bearish_cross = (prev_stoch_k > prev_stoch_d) and (latest_data['STOCHk_14_3_3'] < latest_data['STOCHd_14_3_3']) and (latest_data['STOCHd_14_3_3'] > 50)
+        stoch_bullish_cross = (prev_stoch_k < prev_stoch_d) and (latest_data['Stoch_K'] > latest_data['Stoch_D']) and (latest_data['Stoch_D'] < 50)
+        stoch_bearish_cross = (prev_stoch_k > prev_stoch_d) and (latest_data['Stoch_K'] < latest_data['Stoch_D']) and (latest_data['Stoch_D'] > 50)
         
         technical_bias = "NEUTRAL"
         if macd_bullish and stoch_bullish_cross:
-             technical_bias = "BUY"
+              technical_bias = "BUY"
         elif macd_bearish and stoch_bearish_cross:
-             technical_bias = "SELL"
+              technical_bias = "SELL"
         
         entry_price = latest_close # Entry is the close price of the signal bar
         
@@ -569,7 +597,7 @@ class SignalGenerator:
         return {
             "signal": signal, 
             "reason": reason, 
-            "timestamp": new_bar.name.strftime('%Y-%m-%d %H:%M:%S'), 
+            "timestamp": latest_data.name.strftime('%Y-%m-%d %H:%M:%S'), 
             "entry_price": entry_price if signal != "HOLD" else None,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
@@ -578,11 +606,19 @@ class SignalGenerator:
         }
 
 
-# --- Main Execution ---
+# --- Main Execution Function (renamed and modified to run independent of Flask) ---
 
-def run_signal_generation():
+def run_signal_generation_logic():
     """Initializes and runs the signal generation, backtesting, and email process."""
     
+    # 💡 IMPORTANT: Check for API keys before starting
+    if not ALPHA_VANTAGE_API_KEY:
+        print("FATAL: ALPHA_VANTAGE_API_KEY environment variable is not set. Exiting.")
+        return {"signal": "HOLD", "reason": "Missing Alpha Vantage API Key."}
+    
+    if not MARKETAUX_API_KEY:
+        print("WARNING: MARKETAUX_API_KEY environment variable is not set. Sentiment will be 0.0.")
+
     market_data_api = AlphaVantageDataFeed(api_key=ALPHA_VANTAGE_API_KEY)
     sentiment_api = MarketAuxProcessor(api_key=MARKETAUX_API_KEY)
 
@@ -593,7 +629,7 @@ def run_signal_generation():
     
     if generator.data is None or generator.data.empty:
         print("\nFATAL: Initialization failed. Exiting.")
-        return
+        return {"signal": "HOLD", "reason": "Historical data initialization failed."}
 
     # 2. Backtest the predicted signals
     print("\n" + "="*50)
@@ -635,9 +671,9 @@ SIGNAL: {signal_result['signal']}
 TIMESTAMP (Signal Close): {signal_result.get('timestamp', 'N/A')}
 
 --- TRADE DETAILS ---
-ENTRY PRICE: {signal_result.get('entry_price', 'N/A'):.5f}
-STOP LOSS (SL) PRICE: {signal_result.get('stop_loss', 'N/A'):.5f} ({signal_result.get('sl_pips', 'N/A')} pips)
-TAKE PROFIT (TP) PRICE: {signal_result.get('take_profit', 'N/A'):.5f} ({signal_result.get('tp_pips', 'N/A')} pips)
+ENTRY PRICE: {signal_result.get('entry_price', 'N/A') if signal_result.get('entry_price') is None else f"{signal_result['entry_price']:.5f}"}
+STOP LOSS (SL) PRICE: {signal_result.get('stop_loss', 'N/A') if signal_result.get('stop_loss') is None else f"{signal_result['stop_loss']:.5f}"} ({signal_result.get('sl_pips', 'N/A')} pips)
+TAKE PROFIT (TP) PRICE: {signal_result.get('take_profit', 'N/A') if signal_result.get('take_profit') is None else f"{signal_result['take_profit']:.5f}"} ({signal_result.get('tp_pips', 'N/A')} pips)
 Risk/Reward Ratio: 1:1.5
 
 REASON: {signal_result['reason']}
@@ -650,7 +686,7 @@ REASON: {signal_result['reason']}
     print("### TRADING SIGNAL NOTIFICATION ###")
     print(f"PAIR: {generator.symbol}")
     print(f"SIGNAL: **{signal_result['signal']}**")
-    print(f"Entry: {signal_result.get('entry_price', 'N/A'):.5f} | SL: {signal_result.get('stop_loss', 'N/A'):.5f} | TP: {signal_result.get('take_profit', 'N/A'):.5f}")
+    print(f"Entry: {signal_result.get('entry_price', 'N/A') if signal_result.get('entry_price') is None else f'{signal_result["entry_price"]:.5f}'} | SL: {signal_result.get('stop_loss', 'N/A') if signal_result.get('stop_loss') is None else f'{signal_result["stop_loss"]:.5f}'} | TP: {signal_result.get('take_profit', 'N/A') if signal_result.get('take_profit') is None else f'{signal_result["take_profit"]:.5f}'}")
     print(f"Reason: {signal_result['reason']}")
     print("#"*50 + "\n")
 
@@ -666,5 +702,35 @@ REASON: {signal_result['reason']}
         recipient=MAIL_RECIPIENT
     )
     
-if __name__ == "__main__":
-    run_signal_generation()
+    return signal_result
+
+# --- Flask Routes ---
+
+@app.route('/', methods=['GET'])
+def home():
+    """Simple status check endpoint."""
+    return "Trading Signal Generator is running. Use /run to execute the logic."
+
+@app.route('/run', methods=['POST', 'GET'])
+def run_script():
+    """
+    Endpoint to trigger the trading logic.
+    It returns a response immediately and runs the heavy logic in a separate thread.
+    """
+    print("--- Received request to run trading logic ---")
+    
+    # Start the main logic in a separate thread so the HTTP request returns immediately.
+    # This prevents the deployment platform (Render) from timing out the request.
+    thread = Thread(target=run_signal_generation_logic)
+    thread.start()
+    
+    response = {
+        "status": "Processing started",
+        "message": "The trading signal generation and backtest logic is running in the background. Check logs/email for results."
+    }
+    
+    return jsonify(response), 202
+
+# The Flask application runs only when executed directly (e.g., for local testing).
+# Gunicorn handles this when deployed, running `gunicorn app:app`.
+# Removed the `if __name__ == "__main__":` block that was calling `run_signal_generation()`.
