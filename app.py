@@ -12,11 +12,11 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import os
-import traceback # 💡 NEW: Import traceback for detailed error logging
+import traceback 
+from threading import Thread # 💡 RE-ADDED: Import Thread for asynchronous execution
 
-# 💡 NEW: Flask Imports
+# 💡 Flask Imports
 from flask import Flask, jsonify, request
-# Removed: from threading import Thread (We will run logic directly in the request thread)
 
 # --- Flask Application Setup ---
 app = Flask(__name__)
@@ -33,7 +33,7 @@ MAIL_PORT = int(os.environ.get("MAIL_PORT", 465))
 MAIL_SENDER = os.environ.get("MAIL_SENDER")
 MAIL_RECIPIENT = os.environ.get("MAIL_RECIPIENT")
 
-# --- 0. Email Utility Function ---
+# --- 0. Email Utility Function (No changes) ---
 
 def send_email_notification(subject: str, body: str, recipient: str):
     """Sends an email using the configured SMTP settings."""
@@ -60,12 +60,9 @@ def send_email_notification(subject: str, body: str, recipient: str):
         print(f"FATAL EMAIL ERROR: Failed to send email: {e}")
 
 
-# --- 1. Data Feed (Alpha Vantage) ---
-# (Class Definitions for DataFeed and AlphaVantageDataFeed remain unchanged)
+# --- 1. Data Feed (Alpha Vantage) (No changes) ---
 class DataFeed:
-    """
-    Base class for fetching both historical and real-time market data.
-    """
+    """Base class for fetching both historical and real-time market data."""
     def fetch_historical_data(self, symbol: str, interval: str, lookback_years: int) -> pd.DataFrame:
         raise NotImplementedError
 
@@ -74,17 +71,18 @@ class DataFeed:
 
 class AlphaVantageDataFeed(DataFeed):
     BASE_URL = "https://www.alphavantage.co/query"
-    TIME_INTERVAL = "60min" # Fixed to 1 hour as per your strategy
+    TIME_INTERVAL = "60min" 
     
     def __init__(self, api_key: str):
         self.api_key = api_key
-        # 💡 NOTE: In a multi-user or scaled environment, this cache would need to be external (Redis/DB).
-        # For a single background task on Render, a class cache is acceptable.
         self.data_cache = {} 
 
     def fetch_historical_data(self, symbol: str, interval: str, lookback_years: int) -> pd.DataFrame:
         """
         Fetches up to 2 years of 60min historical Forex data for EUR/USD.
+        
+        NOTE: This function contains mandatory 'time.sleep(15)' calls, 
+        making it the reason for the worker timeout when run synchronously.
         """
         
         from_symbol, to_symbol = symbol[:3], symbol[4:]
@@ -93,8 +91,6 @@ class AlphaVantageDataFeed(DataFeed):
             print(f"DEBUG: Historical Data for {symbol} loaded from cache.")
             return self.data_cache[symbol].copy()
         
-        # 💡 NOTE: The full historical fetching logic is lengthy but preserved here.
-        # Ensure you have a premium Alpha Vantage key to handle 24 slices/month/year.
         print(f"DEBUG: Fetching historical {interval} data for {symbol} (up to 2 years)...")
         
         slices = [f"year{y}month{m}" for y in [1, 2] for m in range(1, 13)]
@@ -117,6 +113,7 @@ class AlphaVantageDataFeed(DataFeed):
             }
             
             try:
+                # 💡 This is the line that causes the Gunicorn timeout when sleep is active.
                 response = requests.get(self.BASE_URL, params=params, timeout=30) 
                 response.raise_for_status() 
 
@@ -203,12 +200,9 @@ class AlphaVantageDataFeed(DataFeed):
             return pd.Series()
 
 
-# --- 2. Fundamental Processor (MarketAux) ---
-# (Class Definitions for FundamentalProcessor and MarketAuxProcessor remain unchanged)
+# --- 2. Fundamental Processor (MarketAux) (No changes) ---
 class FundamentalProcessor:
-    """
-    Base class for fetching fundamental/sentiment data.
-    """
+    """Base class for fetching fundamental/sentiment data."""
     def fetch_realtime_sentiment(self) -> float:
         raise NotImplementedError
 
@@ -219,9 +213,7 @@ class MarketAuxProcessor(FundamentalProcessor):
         self.api_key = api_key
 
     def fetch_realtime_sentiment(self) -> float:
-        """
-        Fetches the latest financial news sentiment relevant to EUR/USD.
-        """
+        """Fetches the latest financial news sentiment relevant to EUR/USD."""
         
         params = {
             "api_token": self.api_key,
@@ -279,8 +271,7 @@ class MarketAuxProcessor(FundamentalProcessor):
             return 0.0
 
 
-# --- 3. Trading Strategy and Signal Generation (Updated for Precision) ---
-# (Class Definitions for Backtester and SignalGenerator remain unchanged)
+# --- 3. Trading Strategy and Signal Generation (No changes) ---
 class Backtester:
     """
     Implements the backtesting of the MACD + Stochastic + Fundamental strategy with 
@@ -314,7 +305,6 @@ class Backtester:
         Generates buy/sell/hold signals based on technical and simulated fundamental data.
         """
         # SIMULATION: Create a synthetic historical sentiment series.
-        # This is for backtest logic demonstration only, not accuracy.
         np.random.seed(42)
         price_diff = self.data['close'].diff().fillna(0)
         simulated_sentiment = np.clip(price_diff.rolling(window=10).mean().fillna(0) * 5 + np.random.normal(0, 0.1, len(self.data)), -1, 1)
@@ -606,7 +596,7 @@ class SignalGenerator:
         }
 
 
-# --- Main Execution Function (Modified for Debugging) ---
+# --- Main Execution Function (No Changes) ---
 
 def run_signal_generation_logic():
     """Initializes and runs the signal generation, backtesting, and email process."""
@@ -726,7 +716,7 @@ REASON: {signal_result['reason']}
         return {"signal": "ERROR", "reason": f"Critical runtime error: {e}"}
 
 
-# --- Flask Routes (Modified to run synchronously) ---
+# --- Flask Routes (Reverted to Asynchronous) ---
 
 @app.route('/', methods=['GET'])
 def home():
@@ -736,26 +726,24 @@ def home():
 @app.route('/run', methods=['POST', 'GET'])
 def run_script():
     """
-    Endpoint to trigger the trading logic. The logic now runs synchronously
-    within the request thread to ensure all print statements are captured.
+    Endpoint to trigger the trading logic. The logic is now run in a separate 
+    thread to prevent Gunicorn worker timeouts.
     """
-    print("--- Received request to run trading logic (Running Synchronously) ---")
+    print("--- Received request to run trading logic (Starting Background Thread) ---")
     
-    # 💡 CHANGE: Run the logic directly, not in a new thread
-    signal_result = run_signal_generation_logic()
+    # 💡 FIX: Start the long-running logic in a separate thread.
+    # This prevents the request from hanging for 6+ minutes and causing the timeout.
+    thread = Thread(target=run_signal_generation_logic)
+    thread.start()
     
-    # Return the final signal result to the user
+    # Return immediately (HTTP 202 Accepted)
     response = {
-        "status": "Processing completed",
-        "signal": signal_result['signal'],
-        "reason": signal_result['reason'],
-        "details": signal_result
+        "status": "Processing started in background",
+        "message": "The signal generation logic is running asynchronously. Check the application logs and your email for the final signal output."
     }
     
-    # Return 500 status on critical error
-    status_code = 500 if signal_result['signal'] == 'ERROR' else 200
-    
-    return jsonify(response), status_code
+    # Return 202 Accepted, indicating the request has been accepted for processing.
+    return jsonify(response), 202
 
 # The Flask application runs only when executed directly (e.g., for local testing).
 if __name__ == "__main__":
