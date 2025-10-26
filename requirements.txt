@@ -5,3 +5,5 @@ pandas-ta
 numpy
 # For email sending
 secure-smtplib # Recommended for better security than standard smtplib
+Flask
+gunicorn
