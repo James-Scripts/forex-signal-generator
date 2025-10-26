@@ -12,10 +12,11 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import os
+import traceback # 💡 NEW: Import traceback for detailed error logging
 
 # 💡 NEW: Flask Imports
 from flask import Flask, jsonify, request
-from threading import Thread
+# Removed: from threading import Thread (We will run logic directly in the request thread)
 
 # --- Flask Application Setup ---
 app = Flask(__name__)
@@ -46,21 +47,21 @@ def send_email_notification(subject: str, body: str, recipient: str):
     msg['Subject'] = subject
     msg.attach(MIMEText(body, 'plain'))
 
-    print(f"Attempting to send email to {recipient}...")
+    print(f"DEBUG: Attempting to send email to {recipient}...")
     try:
         # Use SSL connection (port 465)
         with smtplib.SMTP_SSL(MAIL_SERVER, MAIL_PORT) as server:
             server.login(MAIL_USERNAME, MAIL_PASSWORD)
             server.sendmail(MAIL_SENDER, recipient, msg.as_string())
-        print("Email notification sent successfully!")
+        print("DEBUG: Email notification sent successfully!")
     except smtplib.SMTPAuthenticationError:
-        print("ERROR: SMTP Authentication failed. Check your username and App Password.")
+        print("FATAL EMAIL ERROR: SMTP Authentication failed. Check your username and App Password.")
     except Exception as e:
-        print(f"ERROR: Failed to send email: {e}")
+        print(f"FATAL EMAIL ERROR: Failed to send email: {e}")
 
 
 # --- 1. Data Feed (Alpha Vantage) ---
-
+# (Class Definitions for DataFeed and AlphaVantageDataFeed remain unchanged)
 class DataFeed:
     """
     Base class for fetching both historical and real-time market data.
@@ -89,19 +90,19 @@ class AlphaVantageDataFeed(DataFeed):
         from_symbol, to_symbol = symbol[:3], symbol[4:]
         
         if symbol in self.data_cache:
-            print(f"Historical Data for {symbol} loaded from cache.")
+            print(f"DEBUG: Historical Data for {symbol} loaded from cache.")
             return self.data_cache[symbol].copy()
         
         # 💡 NOTE: The full historical fetching logic is lengthy but preserved here.
         # Ensure you have a premium Alpha Vantage key to handle 24 slices/month/year.
-        print(f"Fetching historical {interval} data for {symbol} (up to 2 years)...")
+        print(f"DEBUG: Fetching historical {interval} data for {symbol} (up to 2 years)...")
         
         slices = [f"year{y}month{m}" for y in [1, 2] for m in range(1, 13)]
         all_data = []
         
         for i, slice_name in enumerate(slices):
             if i > 0:
-                print(f"Pausing for 15 seconds after slice {i+1} to respect Alpha Vantage rate limit...")
+                print(f"DEBUG: Pausing for 15 seconds after slice {i+1} to respect Alpha Vantage rate limit...")
                 time.sleep(15)
 
             params = {
@@ -125,7 +126,7 @@ class AlphaVantageDataFeed(DataFeed):
 
                 df_slice = pd.read_csv(StringIO(response.text))
                 all_data.append(df_slice)
-                print(f"Fetched slice: {slice_name} ({len(df_slice)} rows)")
+                print(f"DEBUG: Fetched slice: {slice_name} ({len(df_slice)} rows)")
 
             except requests.exceptions.RequestException as e:
                 print(f"API request failed for slice {slice_name}: {e}")
@@ -136,7 +137,7 @@ class AlphaVantageDataFeed(DataFeed):
                 continue
 
         if not all_data:
-            print("Failed to fetch any historical data.")
+            print("ERROR: Failed to fetch any historical data.")
             return pd.DataFrame()
 
         full_df = pd.concat(all_data, ignore_index=True)
@@ -179,7 +180,7 @@ class AlphaVantageDataFeed(DataFeed):
                 if "Thank you for using Alpha Vantage" in str(data):
                     print("Alpha Vantage rate limit hit. Pausing and returning empty series.")
                     time.sleep(60)
-                print(f"Error fetching real-time bar: {error_msg}")
+                print(f"ERROR fetching real-time bar: {error_msg}")
                 return pd.Series()
             
             latest_time = list(data[time_series_key].keys())[0]
@@ -203,7 +204,7 @@ class AlphaVantageDataFeed(DataFeed):
 
 
 # --- 2. Fundamental Processor (MarketAux) ---
-
+# (Class Definitions for FundamentalProcessor and MarketAuxProcessor remain unchanged)
 class FundamentalProcessor:
     """
     Base class for fetching fundamental/sentiment data.
@@ -279,7 +280,7 @@ class MarketAuxProcessor(FundamentalProcessor):
 
 
 # --- 3. Trading Strategy and Signal Generation (Updated for Precision) ---
-
+# (Class Definitions for Backtester and SignalGenerator remain unchanged)
 class Backtester:
     """
     Implements the backtesting of the MACD + Stochastic + Fundamental strategy with 
@@ -294,7 +295,7 @@ class Backtester:
 
     def calculate_technical_indicators(self):
         """Calculates MACD and Stochastic Oscillator using the pandas_ta library."""
-        print("Calculating technical indicators (MACD, Stochastic)...")
+        print("DEBUG: Calculating technical indicators (MACD, Stochastic)...")
         # MACD (12, 26, 9)
         self.data.ta.macd(close='close', fast=12, slow=26, signal=9, append=True)
         # Stochastic Oscillator (14, 3, 3)
@@ -483,14 +484,14 @@ class SignalGenerator:
         self.data = self.data_feed.fetch_historical_data(self.symbol, self.interval, self.lookback_years)
         
         if self.data is not None and not self.data.empty:
-            print(f"Historical Data loaded. Total bars: {len(self.data)}")
+            print(f"DEBUG: Historical Data loaded. Total bars: {len(self.data)}")
             
             # Calculate initial technical indicators on the historical data
             self.data.ta.macd(close='close', fast=self.MACD_FAST, slow=self.MACD_SLOW, signal=self.MACD_SIGNAL, append=True)
             self.data.ta.stoch(high='high', low='low', close='close', k=self.STOCH_K, d=self.STOCH_D, smooth_k=3, append=True)
 
             self.data.dropna(inplace=True)
-            print(f"Historical Data ready. Bars after cleanup: {len(self.data)}")
+            print(f"DEBUG: Historical Data ready. Bars after cleanup: {len(self.data)}")
             
             # Rename for access
             self.data.rename(columns={
@@ -500,7 +501,7 @@ class SignalGenerator:
             }, inplace=True)
             
         else:
-            print("Initialization failed. Cannot proceed with historical data.")
+            print("ERROR: Initialization failed. Cannot proceed with historical data.")
 
     def generate_signal(self) -> Dict[str, Any]:
         """
@@ -508,18 +509,17 @@ class SignalGenerator:
         calculating precise entry/exit prices.
         """
         if self.data is None or self.data.empty:
-            print("Historical data not initialized. Cannot generate signal.")
+            print("ERROR: Historical data not initialized. Cannot generate signal.")
             return {"signal": "HOLD", "reason": "Historical data missing."}
 
         # 1. Fetch Latest Bar
-        print("\n--- Fetching Real-Time Market Data ---")
+        print("\n--- Running Step 1: Fetching Real-Time Market Data ---")
         new_bar = self.data_feed.fetch_realtime_bar(self.symbol, self.interval)
         
         if new_bar.empty:
             return {"signal": "HOLD", "reason": "Failed to fetch real-time bar."}
 
         # Append new bar and recalculate indicators for the latest point
-        # This approach ensures indicators are calculated over the full history + new bar
         temp_data = self.data.copy()
         temp_data.loc[new_bar.name] = new_bar.copy()
         temp_data.sort_index(inplace=True)
@@ -548,7 +548,7 @@ class SignalGenerator:
         prev_stoch_d = prev_data['Stoch_D']
         
         # 2. Fetch Latest Fundamental Score
-        print("--- Fetching Real-Time Fundamental Sentiment ---")
+        print("--- Running Step 2: Fetching Real-Time Fundamental Sentiment ---")
         fundamental_score = self.fundamental_processor.fetch_realtime_sentiment()
         
         # 3. Decision Logic and Price Calculation
@@ -606,7 +606,7 @@ class SignalGenerator:
         }
 
 
-# --- Main Execution Function (renamed and modified to run independent of Flask) ---
+# --- Main Execution Function (Modified for Debugging) ---
 
 def run_signal_generation_logic():
     """Initializes and runs the signal generation, backtesting, and email process."""
@@ -619,51 +619,55 @@ def run_signal_generation_logic():
     if not MARKETAUX_API_KEY:
         print("WARNING: MARKETAUX_API_KEY environment variable is not set. Sentiment will be 0.0.")
 
-    market_data_api = AlphaVantageDataFeed(api_key=ALPHA_VANTAGE_API_KEY)
-    sentiment_api = MarketAuxProcessor(api_key=MARKETAUX_API_KEY)
+    try:
+        market_data_api = AlphaVantageDataFeed(api_key=ALPHA_VANTAGE_API_KEY)
+        sentiment_api = MarketAuxProcessor(api_key=MARKETAUX_API_KEY)
 
-    generator = SignalGenerator(data_feed=market_data_api, fundamental_processor=sentiment_api)
+        generator = SignalGenerator(data_feed=market_data_api, fundamental_processor=sentiment_api)
 
-    # 1. Initialize historical data (runs once)
-    generator.initialize_data()
-    
-    if generator.data is None or generator.data.empty:
-        print("\nFATAL: Initialization failed. Exiting.")
-        return {"signal": "HOLD", "reason": "Historical data initialization failed."}
+        # 1. Initialize historical data (runs once)
+        print("\n" + "="*50)
+        print("### STEP 1: INITIALIZING DATA ###")
+        print("="*50)
+        generator.initialize_data()
+        
+        if generator.data is None or generator.data.empty:
+            print("\nFATAL: Initialization failed. Exiting.")
+            return {"signal": "HOLD", "reason": "Historical data initialization failed."}
 
-    # 2. Backtest the predicted signals
-    print("\n" + "="*50)
-    print("### RUNNING BACKTESTING (SL: 25 pips, TP: 37.5 pips) ###")
-    print("="*50)
-    
-    backtester = Backtester(
-        data=generator.data.copy(),
-        fundamental_threshold=generator.FUNDAMENTAL_THRESHOLD,
-        sl_pips=generator.STOP_LOSS_PIPS,
-        tp_pips=generator.TAKE_PROFIT_PIPS
-    )
-    backtest_results = backtester.run_backtest()
+        # 2. Backtest the predicted signals
+        print("\n" + "="*50)
+        print("### STEP 2: RUNNING BACKTESTING ###")
+        print("="*50)
+        
+        backtester = Backtester(
+            data=generator.data.copy(),
+            fundamental_threshold=generator.FUNDAMENTAL_THRESHOLD,
+            sl_pips=generator.STOP_LOSS_PIPS,
+            tp_pips=generator.TAKE_PROFIT_PIPS
+        )
+        backtest_results = backtester.run_backtest()
 
-    print("\n" + "*"*50)
-    print("### BACKTEST RESULTS (Using Fixed TP/SL) ###")
-    print(f"Total Trades Analyzed: {backtest_results['total_trades']}")
-    print(f"Winning Trades: {backtest_results['winning_trades']}")
-    print(f"Net Pips Gained: **{backtest_results['net_pips']:.2f}**")
-    print(f"Profit Factor: **{backtest_results['profit_factor']:.2f}**")
-    print(f"Details: {backtest_results['reason']}")
-    print("*"*50)
-    
-    # 3. Run the real-time signal generation
-    print("\n" + "="*50)
-    print("SIMULATING SINGLE REAL-TIME SIGNAL RUN")
-    print("="*50 + "\n")
-    
-    signal_result = generator.generate_signal()
-    
-    # 4. Print and Email the result
-    
-    # Create the email content body
-    email_body = f"""
+        print("\n" + "*"*50)
+        print("### BACKTEST RESULTS (Using Fixed TP/SL) ###")
+        print(f"Total Trades Analyzed: {backtest_results['total_trades']}")
+        print(f"Winning Trades: {backtest_results['winning_trades']}")
+        print(f"Net Pips Gained: **{backtest_results['net_pips']:.2f}**")
+        print(f"Profit Factor: **{backtest_results['profit_factor']:.2f}**")
+        print(f"Details: {backtest_results['reason']}")
+        print("*"*50)
+        
+        # 3. Run the real-time signal generation
+        print("\n" + "="*50)
+        print("### STEP 3: GENERATING REAL-TIME SIGNAL ###")
+        print("="*50 + "\n")
+        
+        signal_result = generator.generate_signal()
+        
+        # 4. Print and Email the result
+        
+        # Create the email content body
+        email_body = f"""
 TRADING SIGNAL NOTIFICATION - EUR/USD ({generator.interval})
 
 PAIR: {generator.symbol}
@@ -680,31 +684,49 @@ REASON: {signal_result['reason']}
 
 *NOTE: Enter the trade at the ENTRY PRICE (close of the signal bar) and set your Stop Loss and Take Profit levels immediately to manage risk.*
 """
-    
-    # Console output
-    print("\n" + "#"*50)
-    print("### TRADING SIGNAL NOTIFICATION ###")
-    print(f"PAIR: {generator.symbol}")
-    print(f"SIGNAL: **{signal_result['signal']}**")
-    print(f"Entry: {signal_result.get('entry_price', 'N/A') if signal_result.get('entry_price') is None else f'{signal_result["entry_price"]:.5f}'} | SL: {signal_result.get('stop_loss', 'N/A') if signal_result.get('stop_loss') is None else f'{signal_result["stop_loss"]:.5f}'} | TP: {signal_result.get('take_profit', 'N/A') if signal_result.get('take_profit') is None else f'{signal_result["take_profit"]:.5f}'}")
-    print(f"Reason: {signal_result['reason']}")
-    print("#"*50 + "\n")
+        # Console output
+        print("\n" + "#"*50)
+        print("### 🔔 FINAL TRADING SIGNAL NOTIFICATION 🔔 ###")
+        print(f"PAIR: {generator.symbol}")
+        print(f"SIGNAL: **{signal_result['signal']}**")
+        print(f"Timestamp: {signal_result.get('timestamp', 'N/A')}")
+        print(f"Entry: {signal_result.get('entry_price', 'N/A') if signal_result.get('entry_price') is None else f'{signal_result["entry_price"]:.5f}'}")
+        print(f"SL: {signal_result.get('stop_loss', 'N/A') if signal_result.get('stop_loss') is None else f'{signal_result["stop_loss"]:.5f}'} | TP: {signal_result.get('take_profit', 'N/A') if signal_result.get('take_profit') is None else f'{signal_result["take_profit"]:.5f}'}")
+        print(f"Reason: {signal_result['reason']}")
+        print("#"*50 + "\n")
 
-    # Email function call
-    if signal_result['signal'] != "HOLD":
-        subject = f"**{signal_result['signal']}** Signal Generated for EUR/USD!"
-    else:
-        subject = "HOLD Signal Generated for EUR/USD."
+        # Email function call
+        if signal_result['signal'] != "HOLD":
+            subject = f"**{signal_result['signal']}** Signal Generated for EUR/USD!"
+        else:
+            subject = "HOLD Signal Generated for EUR/USD."
+            
+        send_email_notification(
+            subject=subject,
+            body=email_body,
+            recipient=MAIL_RECIPIENT
+        )
         
-    send_email_notification(
-        subject=subject,
-        body=email_body,
-        recipient=MAIL_RECIPIENT
-    )
-    
-    return signal_result
+        return signal_result
 
-# --- Flask Routes ---
+    except Exception as e:
+        print("\n" + "!"*50)
+        print("### 🛑 CRITICAL EXECUTION ERROR DURING RUNTIME 🛑 ###")
+        print(f"An unexpected error occurred: {e}")
+        # Use traceback to print the full stack trace for debugging
+        print("\n--- Detailed Stack Trace ---")
+        traceback.print_exc()
+        print("!"*50 + "\n")
+        
+        # Attempt to notify via email about the failure
+        error_subject = "FATAL: Trading Bot Execution Failed"
+        error_body = f"The trading signal logic encountered a critical error:\n\nError: {e}\n\nTraceback:\n{traceback.format_exc()}"
+        send_email_notification(error_subject, error_body, MAIL_RECIPIENT)
+        
+        return {"signal": "ERROR", "reason": f"Critical runtime error: {e}"}
+
+
+# --- Flask Routes (Modified to run synchronously) ---
 
 @app.route('/', methods=['GET'])
 def home():
@@ -714,23 +736,29 @@ def home():
 @app.route('/run', methods=['POST', 'GET'])
 def run_script():
     """
-    Endpoint to trigger the trading logic.
-    It returns a response immediately and runs the heavy logic in a separate thread.
+    Endpoint to trigger the trading logic. The logic now runs synchronously
+    within the request thread to ensure all print statements are captured.
     """
-    print("--- Received request to run trading logic ---")
+    print("--- Received request to run trading logic (Running Synchronously) ---")
     
-    # Start the main logic in a separate thread so the HTTP request returns immediately.
-    # This prevents the deployment platform (Render) from timing out the request.
-    thread = Thread(target=run_signal_generation_logic)
-    thread.start()
+    # 💡 CHANGE: Run the logic directly, not in a new thread
+    signal_result = run_signal_generation_logic()
     
+    # Return the final signal result to the user
     response = {
-        "status": "Processing started",
-        "message": "The trading signal generation and backtest logic is running in the background. Check logs/email for results."
+        "status": "Processing completed",
+        "signal": signal_result['signal'],
+        "reason": signal_result['reason'],
+        "details": signal_result
     }
     
-    return jsonify(response), 202
+    # Return 500 status on critical error
+    status_code = 500 if signal_result['signal'] == 'ERROR' else 200
+    
+    return jsonify(response), status_code
 
 # The Flask application runs only when executed directly (e.g., for local testing).
-# Gunicorn handles this when deployed, running `gunicorn app:app`.
-# Removed the `if __name__ == "__main__":` block that was calling `run_signal_generation()`.
+if __name__ == "__main__":
+    print("Starting Flask server for manual execution...")
+    # NOTE: In a production environment, you should use gunicorn or similar
+    app.run(host='0.0.0.0', port=os.environ.get("PORT", 5000))
