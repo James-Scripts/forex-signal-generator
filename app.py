@@ -13,7 +13,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import os
 import traceback 
-from threading import Thread # 💡 RE-ADDED: Import Thread for asynchronous execution
+from threading import Thread 
 
 # 💡 Flask Imports
 from flask import Flask, jsonify, request
@@ -33,7 +33,7 @@ MAIL_PORT = int(os.environ.get("MAIL_PORT", 465))
 MAIL_SENDER = os.environ.get("MAIL_SENDER")
 MAIL_RECIPIENT = os.environ.get("MAIL_RECIPIENT")
 
-# --- 0. Email Utility Function (No changes) ---
+# --- 0. Email Utility Function ---
 
 def send_email_notification(subject: str, body: str, recipient: str):
     """Sends an email using the configured SMTP settings."""
@@ -60,7 +60,7 @@ def send_email_notification(subject: str, body: str, recipient: str):
         print(f"FATAL EMAIL ERROR: Failed to send email: {e}")
 
 
-# --- 1. Data Feed (Alpha Vantage) (No changes) ---
+# --- 1. Data Feed (Alpha Vantage) ---
 class DataFeed:
     """Base class for fetching both historical and real-time market data."""
     def fetch_historical_data(self, symbol: str, interval: str, lookback_years: int) -> pd.DataFrame:
@@ -80,9 +80,6 @@ class AlphaVantageDataFeed(DataFeed):
     def fetch_historical_data(self, symbol: str, interval: str, lookback_years: int) -> pd.DataFrame:
         """
         Fetches up to 2 years of 60min historical Forex data for EUR/USD.
-        
-        NOTE: This function contains mandatory 'time.sleep(15)' calls, 
-        making it the reason for the worker timeout when run synchronously.
         """
         
         from_symbol, to_symbol = symbol[:3], symbol[4:]
@@ -113,7 +110,6 @@ class AlphaVantageDataFeed(DataFeed):
             }
             
             try:
-                # 💡 This is the line that causes the Gunicorn timeout when sleep is active.
                 response = requests.get(self.BASE_URL, params=params, timeout=30) 
                 response.raise_for_status() 
 
@@ -200,7 +196,7 @@ class AlphaVantageDataFeed(DataFeed):
             return pd.Series()
 
 
-# --- 2. Fundamental Processor (MarketAux) (No changes) ---
+# --- 2. Fundamental Processor (MarketAux) ---
 class FundamentalProcessor:
     """Base class for fetching fundamental/sentiment data."""
     def fetch_realtime_sentiment(self) -> float:
@@ -271,7 +267,7 @@ class MarketAuxProcessor(FundamentalProcessor):
             return 0.0
 
 
-# --- 3. Trading Strategy and Signal Generation (No changes) ---
+# --- 3. Trading Strategy and Signal Generation (Updated for Robustness) ---
 class Backtester:
     """
     Implements the backtesting of the MACD + Stochastic + Fundamental strategy with 
@@ -465,7 +461,7 @@ class SignalGenerator:
     def initialize_data(self):
         """Fetches historical data to build the model's foundation."""
         print(f"\n--- Initializing Historical Data for {self.symbol} ---")
-        # Ensure API key is present
+        
         if not self.data_feed.api_key:
             print("ERROR: Alpha Vantage API Key is missing. Cannot fetch data.")
             self.data = pd.DataFrame()
@@ -480,15 +476,29 @@ class SignalGenerator:
             self.data.ta.macd(close='close', fast=self.MACD_FAST, slow=self.MACD_SLOW, signal=self.MACD_SIGNAL, append=True)
             self.data.ta.stoch(high='high', low='low', close='close', k=self.STOCH_K, d=self.STOCH_D, smooth_k=3, append=True)
 
+            # --- 💡 FIX: Robust Column Renaming and Check ---
+            # Define the expected and desired column names
+            column_mapping = {
+                f'MACDh_{self.MACD_FAST}_{self.MACD_SLOW}_{self.MACD_SIGNAL}': 'MACD_Hist',
+                f'STOCHk_{self.STOCH_K}_3_3': 'Stoch_K',
+                f'STOCHd_{self.STOCH_K}_3_3': 'Stoch_D'
+            }
+            
+            # Filter the map to only include columns that actually exist in the DataFrame
+            valid_renames = {old: new for old, new in column_mapping.items() if old in self.data.columns}
+            
+            if len(valid_renames) < 3:
+                 # Check if the renaming failed due to missing columns
+                 missing_cols = set(column_mapping.keys()) - set(self.data.columns)
+                 print(f"FATAL: One or more technical indicator columns were not created successfully: {missing_cols}. Invalidate data.")
+                 self.data = pd.DataFrame() # Invalidate data
+                 return
+                 
+            self.data.rename(columns=valid_renames, inplace=True)
+            # --- END FIX ---
+
             self.data.dropna(inplace=True)
             print(f"DEBUG: Historical Data ready. Bars after cleanup: {len(self.data)}")
-            
-            # Rename for access
-            self.data.rename(columns={
-                'MACDh_12_26_9': 'MACD_Hist',
-                'STOCHk_14_3_3': 'Stoch_K',
-                'STOCHd_14_3_3': 'Stoch_D'
-            }, inplace=True)
             
         else:
             print("ERROR: Initialization failed. Cannot proceed with historical data.")
@@ -520,9 +530,20 @@ class SignalGenerator:
         
         # Update self.data with the full dataset including the new bar for consistency
         self.data = temp_data.copy()
-        self.data['MACD_Hist'] = macd_results['MACDh_12_26_9']
-        self.data['Stoch_K'] = stoch_results['STOCHk_14_3_3']
-        self.data['Stoch_D'] = stoch_results['STOCHd_14_3_3']
+        
+        # Ensure indicator columns exist before assigning them
+        macd_hist_col = f'MACDh_{self.MACD_FAST}_{self.MACD_SLOW}_{self.MACD_SIGNAL}'
+        stoch_k_col = f'STOCHk_{self.STOCH_K}_3_3'
+        stoch_d_col = f'STOCHd_{self.STOCH_K}_3_3'
+        
+        if macd_hist_col not in macd_results.columns or stoch_k_col not in stoch_results.columns:
+            print("ERROR: Real-time indicator calculation failed to produce expected columns.")
+            return {"signal": "HOLD", "reason": "Real-time indicator calculation failed."}
+            
+        self.data['MACD_Hist'] = macd_results[macd_hist_col]
+        self.data['Stoch_K'] = stoch_results[stoch_k_col]
+        self.data['Stoch_D'] = stoch_results[stoch_d_col]
+        
         self.data.dropna(subset=['MACD_Hist', 'Stoch_K', 'Stoch_D'], inplace=True)
 
         # Get latest and previous data points
@@ -596,12 +617,11 @@ class SignalGenerator:
         }
 
 
-# --- Main Execution Function (No Changes) ---
+# --- Main Execution Function ---
 
 def run_signal_generation_logic():
     """Initializes and runs the signal generation, backtesting, and email process."""
     
-    # 💡 IMPORTANT: Check for API keys before starting
     if not ALPHA_VANTAGE_API_KEY:
         print("FATAL: ALPHA_VANTAGE_API_KEY environment variable is not set. Exiting.")
         return {"signal": "HOLD", "reason": "Missing Alpha Vantage API Key."}
@@ -716,7 +736,7 @@ REASON: {signal_result['reason']}
         return {"signal": "ERROR", "reason": f"Critical runtime error: {e}"}
 
 
-# --- Flask Routes (Reverted to Asynchronous) ---
+# --- Flask Routes ---
 
 @app.route('/', methods=['GET'])
 def home():
@@ -726,13 +746,12 @@ def home():
 @app.route('/run', methods=['POST', 'GET'])
 def run_script():
     """
-    Endpoint to trigger the trading logic. The logic is now run in a separate 
+    Endpoint to trigger the trading logic. The logic is run in a separate 
     thread to prevent Gunicorn worker timeouts.
     """
     print("--- Received request to run trading logic (Starting Background Thread) ---")
     
-    # 💡 FIX: Start the long-running logic in a separate thread.
-    # This prevents the request from hanging for 6+ minutes and causing the timeout.
+    # Start the long-running logic in a separate thread.
     thread = Thread(target=run_signal_generation_logic)
     thread.start()
     
@@ -742,11 +761,8 @@ def run_script():
         "message": "The signal generation logic is running asynchronously. Check the application logs and your email for the final signal output."
     }
     
-    # Return 202 Accepted, indicating the request has been accepted for processing.
     return jsonify(response), 202
 
-# The Flask application runs only when executed directly (e.g., for local testing).
 if __name__ == "__main__":
     print("Starting Flask server for manual execution...")
-    # NOTE: In a production environment, you should use gunicorn or similar
     app.run(host='0.0.0.0', port=os.environ.get("PORT", 5000))
