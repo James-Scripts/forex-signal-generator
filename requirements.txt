@@ -2,7 +2,7 @@ Flask==3.0.0
 gunicorn==20.1.0
 requests==2.32.3
 pandas==2.2.2 
-# Pinning to the latest stable version that is known to work on Python 3.11
-pandas-ta==0.3.14b0 
+# Pinning to a widely distributed, older stable version that should have a Python 3.11 wheel
+pandas-ta==0.3.10b0 
 numpy==1.26.4
 nltk==3.8.1
