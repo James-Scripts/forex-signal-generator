@@ -2,7 +2,7 @@ Flask==3.0.0
 gunicorn==20.1.0
 requests==2.32.3
 pandas==2.2.2 
-# Pinning to a widely distributed, older stable version that should have a Python 3.11 wheel
-pandas-ta==0.3.10b0 
+# Install pandas-ta directly from the source repository to bypass PyPI wheel errors
+pandas-ta @ git+https://github.com/twopirllc/pandas-ta.git@0.3.14b0 
 numpy==1.26.4
 nltk==3.8.1
