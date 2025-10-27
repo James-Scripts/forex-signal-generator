@@ -1,24 +1,8 @@
-# --- Core Data Processing & Utilities ---
-requests
-pandas
-pandas-ta
-numpy
-yfinance  # Required for the YFinanceWrapper data feed
-python-dotenv # Recommended for managing API keys and settings from a .env file
-
-# --- Sentiment Analysis (VADER) ---
-nltk  # Natural Language Toolkit, required for VADER
-
-# --- Server & Deployment ---
-Flask
-gunicorn 
-
-# --- Email Sending ---
-# Note: 'secure-smtplib' is not a standard Python package. 
-# Standard 'smtplib' is built-in. If you meant a package for 
-# managing sensitive data, 'python-dotenv' helps.
-# We will use the standard convention for dependency listing.
-
-# --- Dependency Check ---
-# Final list for the current script
-# requests, pandas, pandas-ta, numpy, yfinance, nltk, Flask, gunicorn
+Flask==3.0.0
+gunicorn==20.1.0
+requests==2.32.3
+pandas==2.2.2
+pandas-ta==0.3.14b0
+numpy==1.26.4
+# Added for sentiment analysis on News API articles
+nltk==3.8.1
