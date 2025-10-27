@@ -60,7 +60,7 @@ def send_email_notification(subject: str, body: str, recipient: str):
         print(f"FATAL EMAIL ERROR: Failed to send email: {e}")
 
 
-# --- 1. Data Feed (Alpha Vantage) ---
+# --- 1. Data Feed (Alpha Vantage) (Updated for robust data validation) ---
 class DataFeed:
     """Base class for fetching both historical and real-time market data."""
     def fetch_historical_data(self, symbol: str, interval: str, lookback_years: int) -> pd.DataFrame:
@@ -80,6 +80,8 @@ class AlphaVantageDataFeed(DataFeed):
     def fetch_historical_data(self, symbol: str, interval: str, lookback_years: int) -> pd.DataFrame:
         """
         Fetches up to 2 years of 60min historical Forex data for EUR/USD.
+        
+        Now includes robust checks to prevent 'Length mismatch' errors.
         """
         
         from_symbol, to_symbol = symbol[:3], symbol[4:]
@@ -118,8 +120,14 @@ class AlphaVantageDataFeed(DataFeed):
                     continue
 
                 df_slice = pd.read_csv(StringIO(response.text))
-                all_data.append(df_slice)
-                print(f"DEBUG: Fetched slice: {slice_name} ({len(df_slice)} rows)")
+                
+                # 💡 FIX 1: Crucial check: only append if it looks like correct data (must have 6 columns)
+                if len(df_slice.columns) == 6:
+                    all_data.append(df_slice)
+                    print(f"DEBUG: Fetched slice: {slice_name} ({len(df_slice)} rows)")
+                else:
+                    print(f"WARNING: Slice {slice_name} was filtered out due to unexpected column count ({len(df_slice.columns)} instead of 6).")
+
 
             except requests.exceptions.RequestException as e:
                 print(f"API request failed for slice {slice_name}: {e}")
@@ -130,11 +138,18 @@ class AlphaVantageDataFeed(DataFeed):
                 continue
 
         if not all_data:
-            print("ERROR: Failed to fetch any historical data.")
+            print("ERROR: Failed to fetch any valid historical data slices.")
             return pd.DataFrame()
 
         full_df = pd.concat(all_data, ignore_index=True)
+        
+        # 💡 FIX 2: Check column count on final concatenated DataFrame before assigning names
+        if len(full_df.columns) != 6:
+            print(f"FATAL ERROR: Final concatenated DataFrame has {len(full_df.columns)} columns, expected 6. Returning empty DataFrame.")
+            return pd.DataFrame()
+
         full_df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+        
         full_df['timestamp'] = pd.to_datetime(full_df['timestamp'])
         full_df.set_index('timestamp', inplace=True)
         full_df.sort_index(inplace=True)
@@ -267,7 +282,7 @@ class MarketAuxProcessor(FundamentalProcessor):
             return 0.0
 
 
-# --- 3. Trading Strategy and Signal Generation (Updated for Robustness) ---
+# --- 3. Trading Strategy and Signal Generation ---
 class Backtester:
     """
     Implements the backtesting of the MACD + Stochastic + Fundamental strategy with 
@@ -476,26 +491,23 @@ class SignalGenerator:
             self.data.ta.macd(close='close', fast=self.MACD_FAST, slow=self.MACD_SLOW, signal=self.MACD_SIGNAL, append=True)
             self.data.ta.stoch(high='high', low='low', close='close', k=self.STOCH_K, d=self.STOCH_D, smooth_k=3, append=True)
 
-            # --- 💡 FIX: Robust Column Renaming and Check ---
-            # Define the expected and desired column names
+            # --- Robust Column Renaming and Check ---
             column_mapping = {
                 f'MACDh_{self.MACD_FAST}_{self.MACD_SLOW}_{self.MACD_SIGNAL}': 'MACD_Hist',
                 f'STOCHk_{self.STOCH_K}_3_3': 'Stoch_K',
                 f'STOCHd_{self.STOCH_K}_3_3': 'Stoch_D'
             }
             
-            # Filter the map to only include columns that actually exist in the DataFrame
             valid_renames = {old: new for old, new in column_mapping.items() if old in self.data.columns}
             
             if len(valid_renames) < 3:
-                 # Check if the renaming failed due to missing columns
                  missing_cols = set(column_mapping.keys()) - set(self.data.columns)
                  print(f"FATAL: One or more technical indicator columns were not created successfully: {missing_cols}. Invalidate data.")
-                 self.data = pd.DataFrame() # Invalidate data
+                 self.data = pd.DataFrame() 
                  return
                  
             self.data.rename(columns=valid_renames, inplace=True)
-            # --- END FIX ---
+            # --- End Robust Column Renaming ---
 
             self.data.dropna(inplace=True)
             print(f"DEBUG: Historical Data ready. Bars after cleanup: {len(self.data)}")
