@@ -1,7 +1,6 @@
 import requests
 import pandas as pd
 import pandas_ta as ta
-import yfinance as yf 
 from datetime import datetime, timedelta
 import time
 import json
@@ -13,33 +12,20 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import os
-import traceback 
-from threading import Thread 
-# 💡 Flask Imports
+import traceback
+from threading import Thread
+# 💡 VADER Sentiment Analysis Import (Required for the strategy, if used later)
+# import nltk 
+# from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from flask import Flask, jsonify, request
-
-# --- NLP Imports for Sentiment Analysis (NEW) ---
-import nltk
-from nltk.sentiment.vader import SentimentIntensityAnalyzer 
-
-# NOTE: For the script to run, ensure you have the 'vader_lexicon' downloaded.
-# Run this once in your terminal or Python environment: 
-# import nltk; nltk.download('vader_lexicon')
 
 # --- Flask Application Setup ---
 app = Flask(__name__)
 
-# ==============================================================================
-# 0. API Keys & Configuration (Unchanged)
-# ==============================================================================
-
-# --- PRICE DATA KEYS ---
-TWELVEDATA_API_KEY = "7ded66b4a2184314a57abd4f8f6b304b"
-FMP_API_KEY = "A0xuQ94tqyjfAKitVIGoNKPNnBX2K0JT"
-
-# --- NEWS DATA KEYS ---
-NEWS_API_KEY_1 = "7ec3a80cd7564d2c8652cd2ec6b83c14" 
-MARKETAUX_API_KEY = os.environ.get("MARKETAUX_API_KEY") # Keeping MarketAux as an environment variable
+# --- API Keys Configuration ---
+# ALPHA_VANTAGE_API_KEY REMOVED
+TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY") # New Price API Key
+MARKETAUX_API_KEY = os.environ.get("MARKETAUX_API_KEY")
 
 # --- EMAIL Configuration ---
 MAIL_USERNAME = os.environ.get("MAIL_USERNAME")
@@ -49,23 +35,19 @@ MAIL_PORT = int(os.environ.get("MAIL_PORT", 465))
 MAIL_SENDER = os.environ.get("MAIL_SENDER")
 MAIL_RECIPIENT = os.environ.get("MAIL_RECIPIENT")
 
-# --- GLOBAL TRADING PARAMS ---
-SYMBOL = "EUR/USD"
-FOREX_TICKER = "EURUSD=X" # Ticker for yfinance
-INTERVAL = "60min"
-DAYS_OF_DATA = 30 # Lookback for yfinance/FMP
-
-# --- 0. Email Utility Function (Unchanged) ---
+# --- 0. Email Utility Function ---
 def send_email_notification(subject: str, body: str, recipient: str):
     """Sends an email using the configured SMTP settings."""
     if not all([MAIL_USERNAME, MAIL_PASSWORD, MAIL_SENDER, recipient]):
         print("ERROR: Email configuration missing. Skipping email notification.")
         return
+    
     msg = MIMEMultipart()
     msg['From'] = MAIL_SENDER
     msg['To'] = recipient
     msg['Subject'] = subject
     msg.attach(MIMEText(body, 'plain'))
+    
     print(f"DEBUG: Attempting to send email to {recipient}...")
     try:
         # Use SSL connection (port 465)
@@ -78,225 +60,185 @@ def send_email_notification(subject: str, body: str, recipient: str):
     except Exception as e:
         print(f"FATAL EMAIL ERROR: Failed to send email: {e}")
 
-# ==============================================================================
-# 1. ENSEMBLE DATA FEED (Unchanged)
-# ==============================================================================
-
-class DataAPIWrapper:
-    """Base class for individual price API wrappers."""
-    def fetch_historical_ohlc(self, symbol: str, interval: str) -> pd.DataFrame:
+# --- 1. Data Feed (TwelveData Replacement) ---
+class DataFeed:
+    """Base class for fetching both historical and real-time market data."""
+    def fetch_historical_data(self, symbol: str, interval: str, lookback_years: int) -> pd.DataFrame:
+        raise NotImplementedError
+    def fetch_realtime_bar(self, symbol: str, interval: str) -> pd.Series:
         raise NotImplementedError
 
-# --- Twelve Data Wrapper ---
-class TwelveDataWrapper(DataAPIWrapper):
-    def fetch_historical_ohlc(self, symbol=SYMBOL, interval=INTERVAL):
-        url = "https://api.twelvedata.com/time_series"
-        params = {
-            "symbol": symbol,
-            "interval": '1h', 
-            "apikey": TWELVEDATA_API_KEY,
-            "outputsize": 500,
-            "timezone": "exchange",
-        }
-        try:
-            response = requests.get(url, params=params, timeout=10).json()
-            if 'values' not in response: return pd.DataFrame()
-            df = pd.DataFrame(response['values'])
-            df['datetime'] = pd.to_datetime(df['datetime'])
-            df.set_index('datetime', inplace=True)
-            return df[['open', 'high', 'low', 'close']].astype(float)
-        except Exception: return pd.DataFrame()
+class TwelveDataFeed(DataFeed):
+    """Fetches market data using the TwelveData API."""
+    BASE_URL = "https://api.twelvedata.com"
+    TIME_INTERVAL = "60min"
 
-# --- FMP Wrapper (Financial Modeling Prep) ---
-class FMPWrapper(DataAPIWrapper):
-    def fetch_historical_ohlc(self, symbol=SYMBOL, interval=INTERVAL):
-        if interval != '60min': return pd.DataFrame()
-        limit = 500
-        url = f"https://financialmodelingprep.com/api/v3/historical-chart/1hour/{symbol.replace('/', '')}" 
-        params = {"apikey": FMP_API_KEY, "limit": limit}
-        try:
-            response = requests.get(url, params=params, timeout=10).json()
-            if not isinstance(response, list) or not response: return pd.DataFrame()
-            df = pd.DataFrame(response)
-            df['date'] = pd.to_datetime(df['date'])
-            df.set_index('date', inplace=True)
-            return df[['open', 'high', 'low', 'close']].astype(float)
-        except Exception: return pd.DataFrame()
-
-# --- Yahoo Finance Wrapper (using yfinance) ---
-class YFinanceWrapper(DataAPIWrapper):
-    def fetch_historical_ohlc(self, symbol=FOREX_TICKER, interval=INTERVAL):
-        try:
-            start_date = (datetime.now() - timedelta(days=DAYS_OF_DATA)).strftime('%Y-%m-%d')
-            df = yf.download(symbol, start=start_date, interval='60m', progress=False, timeout=10)
-            if df.empty: return pd.DataFrame()
-            df.columns = df.columns.str.lower()
-            return df[['open', 'high', 'low', 'close']]
-        except Exception: return pd.DataFrame()
-
-class ReconcilingDataFeed:
-    """Combines historical data from multiple sources for robust analysis."""
-
-    def __init__(self):
-        self.td = TwelveDataWrapper()
-        self.fmp = FMPWrapper()
-        self.yf = YFinanceWrapper()
+    def __init__(self, api_key: str):
+        self.api_key = api_key
         self.data_cache = {}
 
     def fetch_historical_data(self, symbol: str, interval: str, lookback_years: int) -> pd.DataFrame:
-        """Fetches and reconciles historical OHLC data."""
+        """Fetches historical data for the given symbol and interval."""
         if symbol in self.data_cache:
             print(f"DEBUG: Historical Data for {symbol} loaded from cache.")
             return self.data_cache[symbol].copy()
 
-        data_sources = {
-            'TwelveData': self.td.fetch_historical_ohlc(symbol, interval),
-            'FMP': self.fmp.fetch_historical_ohlc(symbol, interval),
-            'YFinance': self.yf.fetch_historical_ohlc(FOREX_TICKER, interval),
+        print(f"DEBUG: Fetching historical {interval} data for {symbol}...")
+        
+        # Calculate start date for lookback
+        start_date = (datetime.now() - timedelta(days=365 * lookback_years)).strftime('%Y-%m-%d')
+        
+        params = {
+            "symbol": symbol.replace('/', ''),
+            "interval": interval,
+            "start_date": start_date,
+            "outputsize": 5000, # Max allowed output size for historical data
+            "apikey": self.api_key
+        }
+
+        try:
+            # TwelveData uses the 'time_series' endpoint for historical bars
+            response = requests.get(f"{self.BASE_URL}/time_series", params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'error' in data or 'message' in data and 'exceeded' in data.get('message', '').lower():
+                print(f"TwelveData API Error: {data.get('message', data.get('error', 'Unknown Error'))}")
+                return pd.DataFrame()
+            
+            if 'values' not in data:
+                print(f"ERROR: TwelveData response missing 'values' key: {data}")
+                return pd.DataFrame()
+
+            df = pd.DataFrame(data['values'])
+            df.rename(columns={'datetime': 'timestamp'}, inplace=True)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df.set_index('timestamp', inplace=True)
+            df = df[['open', 'high', 'low', 'close']].apply(pd.to_numeric)
+            df.sort_index(inplace=True)
+            df.dropna(inplace=True)
+
+            self.data_cache[symbol] = df
+            print(f"DEBUG: Historical Data loaded. Total bars: {len(df)}")
+            return df.copy()
+
+        except requests.exceptions.RequestException as e:
+            print(f"TwelveData API request failed: {e}")
+            return pd.DataFrame()
+        except Exception as e:
+            print(f"Failed to process TwelveData historical data: {e}")
+            return pd.DataFrame()
+
+    def fetch_realtime_bar(self, symbol: str, interval: str) -> pd.Series:
+        """Fetches the latest intraday bar data (simulated from the latest historical bar)."""
+        # For simplicity and to reuse the historical endpoint structure,
+        # we fetch the latest bar from the time_series endpoint.
+        
+        params = {
+            "symbol": symbol.replace('/', ''),
+            "interval": interval,
+            "outputsize": 1, 
+            "apikey": self.api_key
         }
         
-        valid_data = {}
-        for name, df in data_sources.items():
-            if not df.empty and len(df) > 50: # Minimum bars for reliable MACD/Stoch
-                valid_data[name] = df
-            else:
-                print(f"WARNING: {name} data failed or has insufficient data points. Skipping.")
-
-        if len(valid_data) < 2:
-            print(f"FATAL ERROR: Only {len(valid_data)} valid price source(s) loaded. Reconciliation skipped.")
-            # Fallback: return the one valid source or an empty DataFrame
-            return next(iter(valid_data.values())) if valid_data else pd.DataFrame()
-
-        # Step 1: Align all data frames on their index (time)
-        combined_df = pd.concat(valid_data.values(), keys=valid_data.keys(), axis=1, join='inner')
-
-        # Step 2: Reconcile Prices using the Median
-        reconciled_ohlc = pd.DataFrame(index=combined_df.index)
-        
-        for col in ['open', 'high', 'low', 'close']:
-            price_cols = [c for c in combined_df.columns if c[1] == col]
-            reconciled_ohlc[col] = combined_df[price_cols].median(axis=1, skipna=True)
+        try:
+            response = requests.get(f"{self.BASE_URL}/time_series", params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
             
-        # Final cleanup and caching
-        reconciled_ohlc.sort_index(inplace=True)
-        reconciled_ohlc = reconciled_ohlc[~reconciled_ohlc.index.duplicated(keep='first')]
-        self.data_cache[symbol] = reconciled_ohlc.dropna()
-        print(f"DEBUG: Successfully reconciled data from {len(valid_data)} sources. Total bars: {len(self.data_cache[symbol])}")
-        return self.data_cache[symbol].copy()
+            if 'values' not in data or not data['values']:
+                print("ERROR: TwelveData failed to fetch real-time bar.")
+                return pd.Series()
 
-    def fetch_latest_bar(self, symbol: str) -> pd.Series:
-        """Retrieves the latest bar from the cached historical data."""
-        if symbol in self.data_cache and not self.data_cache[symbol].empty:
-            return self.data_cache[symbol].iloc[-1]
-        return pd.Series()
-    
+            latest_bar_data = data['values'][0]
+            timestamp = pd.to_datetime(latest_bar_data.pop('datetime'))
+            
+            latest_bar = pd.Series({
+                'open': float(latest_bar_data['open']),
+                'high': float(latest_bar_data['high']),
+                'low': float(latest_bar_data['low']),
+                'close': float(latest_bar_data['close'])
+            }, name=timestamp)
 
-# ==============================================================================
-# 2. FUNDAMENTAL PROCESSOR (UPDATED for VADER)
-# ==============================================================================
+            return latest_bar
 
-class EnsembleFundamentalProcessor:
-    """Fetches and combines sentiment from multiple news APIs using VADER NLP."""
+        except requests.exceptions.RequestException as e:
+            print(f"TwelveData real-time bar request failed: {e}")
+            return pd.Series()
+        except Exception as e:
+            print(f"Failed to process TwelveData real-time data: {e}")
+            return pd.Series()
 
-    def __init__(self, api_key_1: str, api_key_2: Optional[str]):
-        self.api_key_1 = api_key_1
-        self.api_key_2 = api_key_2
-        # Initialize VADER Sentiment Analyzer (NEW)
-        self.vader = SentimentIntensityAnalyzer()
+# --- 2. Fundamental Processor (MarketAux) (Sentiment API, UNCHANGED) ---
+class FundamentalProcessor:
+    """Base class for fetching fundamental/sentiment data."""
+    def fetch_realtime_sentiment(self) -> float:
+        raise NotImplementedError
 
+class MarketAuxProcessor(FundamentalProcessor):
+    BASE_URL = "https://api.marketaux.com/v1/news/all"
 
-    def _analyze_sentiment(self, text: str) -> float:
-        """Calculates VADER compound score for a given text."""
-        if not text:
-            return 0.0
-        # The compound score is the normalized, weighted composite score (-1 to +1)
-        return self.vader.polarity_scores(text)['compound']
+    def __init__(self, api_key: str):
+        self.api_key = api_key
 
+    def fetch_realtime_sentiment(self) -> float:
+        """Fetches the latest financial news sentiment relevant to EUR/USD."""
 
-    def fetch_realtime_sentiment(self, symbol: str = SYMBOL) -> float:
-        """Fetches the latest financial news sentiment from multiple sources."""
-        
-        scores = []
-        
-        # --- Source 1: News API (VADER Integration) ---
-        url_1 = "https://newsapi.org/v2/everything"
-        params_1 = {
-            "q": f"forex {symbol}",
+        params = {
+            "api_token": self.api_key,
+            "search": "euro OR dollar OR eur/usd",
+            "filter_entities": "true",
             "language": "en",
-            "sortBy": "relevancy",
-            "apiKey": self.api_key_1,
-            "pageSize": 25
+            "limit": 10
         }
-        
-        if self.api_key_1:
-            try:
-                response_1 = requests.get(url_1, params=params_1, timeout=5).json()
-                articles_1 = response_1.get('articles', [])
-                article_scores = []
+        try:
+            response = requests.get(self.BASE_URL, params=params)
+            response.raise_for_status()
+            data = response.json()
 
-                for article in articles_1:
-                    # Combine title and description for a richer text analysis
-                    text = f"{article.get('title', '')} {article.get('description', '')}"
-                    score = self._analyze_sentiment(text)
-                    if score != 0.0:
-                        article_scores.append(score)
+            articles = data.get('data', [])
+
+            if not articles:
+                print("MarketAux: No news articles found for search query.")
+                return 0.0
                 
-                if article_scores:
-                    score_1 = np.mean(article_scores)
-                    scores.append(score_1)
-                    print(f"Source 1 (News API): Analyzed {len(article_scores)} articles. Average VADER Score: {score_1:.2f}")
+            all_sentiments = []
 
-            except Exception as e:
-                print(f"Source 1 (News API) failed to fetch or process: {e}")
-
-        # --- Source 2: MarketAux Processor (VADER Integration) ---
-        if self.api_key_2:
-            url_2 = "https://api.marketaux.com/v1/news/all"
-            # Focusing the search on the currency pair
-            params_2 = {
-                "api_token": self.api_key_2,
-                "search": "euro OR dollar OR eur/usd", 
-                "filter_entities": "true",
-                "language": "en",
-                "limit": 10
-            }
-            try:
-                response_2 = requests.get(url_2, params=params_2, timeout=5).json()
-                articles_2 = response_2.get('data', [])
-                article_scores = []
-
-                for article in articles_2:
-                    # Combine snippet and title for VADER analysis
-                    text = f"{article.get('title', '')} {article.get('snippet', '')}"
-                    
-                    # Instead of complex entity-based math, use the overall article VADER score
-                    score = self._analyze_sentiment(text)
-                    if score != 0.0:
-                        article_scores.append(score)
-                
-                if article_scores:
-                    score_2 = np.mean(article_scores)
-                    scores.append(score_2)
-                    print(f"Source 2 (MarketAux): Analyzed {len(article_scores)} snippets. Average VADER Score: {score_2:.2f}")
-                
-            except Exception as e:
-                print(f"Source 2 (MarketAux) failed to fetch or process: {e}")
-
-        if not scores:
-            print("WARNING: No valid news scores retrieved from any source. Sentiment defaulted to 0.0.")
-            return 0.0
+            for article in articles:
+                entities = article.get('entities', [])
+                for entity in entities:
+                    if entity.get('symbol') in ['EUR', 'USD'] and 'sentiment_score' in entity:
+                        score = entity['sentiment_score']
+                        # Weight EUR sentiment positively, USD sentiment negatively
+                        if entity['symbol'] == 'EUR':
+                            all_sentiments.append(score)
+                        elif entity['symbol'] == 'USD':
+                            all_sentiments.append(-score) # Negative weight for USD sentiment
             
-        # Return the simple average of all successful sources' average scores
-        avg_sentiment = sum(scores) / len(scores)
-        return avg_sentiment
+            if not all_sentiments:
+                # Fallback to article-level sentiment if entity-level is missing
+                article_sentiments = [
+                    a.get('sentiment_score', 0.0)
+                    for a in articles if 'sentiment_score' in a
+                ]
+                if article_sentiments:
+                    print("MarketAux: Using article-level sentiment (treating as EUR/USD composite).")
+                    return sum(article_sentiments) / len(article_sentiments)
+                else:
+                    return 0.0
+                    
+            avg_sentiment = sum(all_sentiments) / len(all_sentiments)
 
+            return avg_sentiment
+        except requests.exceptions.RequestException as e:
+            print(f"MarketAux request failed: {e}")
+            return 0.0
+        except Exception as e:
+            print(f"Failed to process MarketAux data: {e}")
+            return 0.0
 
-# ==============================================================================
-# 3. TRADING STRATEGY AND SIGNAL GENERATION (Unchanged Logic)
-# ==============================================================================
-
+# --- 3. Trading Strategy and Signal Generation (UNCHANGED) ---
 class Backtester:
-    # ... (CLASS CONTENT IS UNCHANGED) ...
     """
     Implements the backtesting of the MACD + Stochastic + Fundamental strategy with
     fixed Take Profit (TP) and Stop Loss (SL).
@@ -307,7 +249,7 @@ class Backtester:
         self.sl_pips = sl_pips
         self.tp_pips = tp_pips
         self.PIP_CONVERSION = 10000.0 # Standard for EUR/USD (4th decimal place, 5th is a "point")
-
+        
     def calculate_technical_indicators(self):
         """Calculates MACD and Stochastic Oscillator using the pandas_ta library."""
         print("DEBUG: Calculating technical indicators (MACD, Stochastic)...")
@@ -323,14 +265,12 @@ class Backtester:
             'STOCHk_14_3_3': 'Stoch_K',
             'STOCHd_14_3_3': 'Stoch_D'
         }, inplace=True)
-
+        
     def generate_historical_signals(self) -> pd.DataFrame:
         """
         Generates buy/sell/hold signals based on technical and simulated fundamental data.
         """
         # SIMULATION: Create a synthetic historical sentiment series.
-        # This simulation remains for backtesting purposes. 
-        # For LIVE signals, the real sentiment from VADER is used.
         np.random.seed(42)
         price_diff = self.data['close'].diff().fillna(0)
         simulated_sentiment = np.clip(price_diff.rolling(window=10).mean().fillna(0) * 5 + np.random.normal(0, 0.1, len(self.data)), -1, 1)
@@ -373,7 +313,7 @@ class Backtester:
 
         if self.data.empty or 'signal' not in self.data.columns:
             return {"net_pips": 0, "total_trades": 0, "profit_factor": 0.0, "reason": "Data or signal generation failed."}
-        
+            
         trades_list = []
         in_trade = False
 
@@ -395,7 +335,7 @@ class Backtester:
                 else: # SELL
                     sl_price = entry_price + (self.sl_pips / self.PIP_CONVERSION)
                     tp_price = entry_price - (self.tp_pips / self.PIP_CONVERSION)
-                
+                    
                 trade = {
                     'entry_time': entry_time,
                     'entry_price': entry_price,
@@ -448,7 +388,7 @@ class Backtester:
 
         if total_trades == 0:
             return {"net_pips": 0, "total_trades": 0, "profit_factor": 0.0, "reason": "No completed trades generated."}
-        
+            
         total_profit = trades_df[trades_df['profit_pips'] > 0]['profit_pips'].sum()
         total_loss = trades_df[trades_df['profit_pips'] < 0]['profit_pips'].sum()
         net_pips = total_profit + total_loss
@@ -465,7 +405,6 @@ class Backtester:
         }
 
 class SignalGenerator:
-    # ... (CLASS CONTENT IS UNCHANGED) ...
     # --- Strategy Tuning Parameters ---
     MACD_FAST = 12
     MACD_SLOW = 26
@@ -480,17 +419,22 @@ class SignalGenerator:
     TAKE_PROFIT_PIPS = STOP_LOSS_PIPS * RISK_REWARD_RATIO
     PIP_CONVERSION = 10000.0 # Standard for EUR/USD
 
-    def __init__(self, data_feed: ReconcilingDataFeed, fundamental_processor: EnsembleFundamentalProcessor):
+    def __init__(self, data_feed: DataFeed, fundamental_processor: FundamentalProcessor):
         self.data_feed = data_feed
         self.fundamental_processor = fundamental_processor
-        self.symbol = SYMBOL
-        self.interval = INTERVAL
-        self.lookback_years = 2 
+        self.symbol = "EUR/USD"
+        self.interval = "60min"
+        self.lookback_years = 2
         self.data: Optional[pd.DataFrame] = None
 
     def initialize_data(self):
-        """Fetches historical data to build the model's foundation using the ReconcilingDataFeed."""
+        """Fetches historical data to build the model's foundation."""
         print(f"\n--- Initializing Historical Data for {self.symbol} ---")
+
+        if not self.data_feed.api_key:
+            print("ERROR: TwelveData API Key is missing. Cannot fetch data.")
+            self.data = pd.DataFrame()
+            return
 
         self.data = self.data_feed.fetch_historical_data(self.symbol, self.interval, self.lookback_years)
 
@@ -526,23 +470,51 @@ class SignalGenerator:
 
     def generate_signal(self) -> Dict[str, Any]:
         """
-        Generates a trade signal based on the latest bar, technical indicators, and fundamental score.
+        Generates a trade signal based on the latest bar, technical indicators, and fundamental score,
+        calculating precise entry/exit prices.
         """
         if self.data is None or self.data.empty:
             print("ERROR: Historical data not initialized. Cannot generate signal.")
             return {"signal": "HOLD", "reason": "Historical data missing."}
 
-        # 1. Fetch Latest Bar (Using the latest bar from the reconciled dataset)
-        print("\n--- Running Step 1: Fetching Latest Market Data from Reconciled Set ---")
-        new_bar = self.data_feed.fetch_latest_bar(self.symbol) 
+        # 1. Fetch Latest Bar
+        print("\n--- Running Step 1: Fetching Real-Time Market Data ---")
+        new_bar = self.data_feed.fetch_realtime_bar(self.symbol, self.interval)
 
         if new_bar.empty:
             return {"signal": "HOLD", "reason": "Failed to fetch real-time bar."}
+            
+        # Append new bar and recalculate indicators for the latest point
+        temp_data = self.data.copy()
+        temp_data.loc[new_bar.name] = new_bar.copy()
+        temp_data.sort_index(inplace=True)
+
+        # Recalculate MACD and Stochastic on the combined dataset
+        macd_results = temp_data['close'].ta.macd(fast=self.MACD_FAST, slow=self.MACD_SLOW, signal=self.MACD_SIGNAL, append=False)
+        stoch_results = temp_data.ta.stoch(high='high', low='low', close='close', k=self.STOCH_K, d=self.STOCH_D, smooth_k=3, append=False)
+
+        # Update self.data with the full dataset including the new bar for consistency
+        self.data = temp_data.copy()
+
+        # Ensure indicator columns exist before assigning them
+        macd_hist_col = f'MACDh_{self.MACD_FAST}_{self.MACD_SLOW}_{self.MACD_SIGNAL}'
+        stoch_k_col = f'STOCHk_{self.STOCH_K}_3_3'
+        stoch_d_col = f'STOCHd_{self.STOCH_K}_3_3'
+
+        if macd_hist_col not in macd_results.columns or stoch_k_col not in stoch_results.columns:
+            print("ERROR: Real-time indicator calculation failed to produce expected columns.")
+            return {"signal": "HOLD", "reason": "Real-time indicator calculation failed."}
+
+        self.data['MACD_Hist'] = macd_results[macd_hist_col]
+        self.data['Stoch_K'] = stoch_results[stoch_k_col]
+        self.data['Stoch_D'] = stoch_results[stoch_d_col]
+
+        self.data.dropna(subset=['MACD_Hist', 'Stoch_K', 'Stoch_D'], inplace=True)
         
         # Get latest and previous data points
         if len(self.data) < 2:
             return {"signal": "HOLD", "reason": "Not enough data points after latest bar append."}
-        
+            
         latest_data = self.data.iloc[-1]
         prev_data = self.data.iloc[-2]
 
@@ -551,11 +523,11 @@ class SignalGenerator:
         prev_stoch_k = prev_data['Stoch_K']
         prev_stoch_d = prev_data['Stoch_D']
 
-        # 2. Fetch Latest Fundamental Score (Now using VADER)
-        print("--- Running Step 2: Fetching Real-Time Fundamental Sentiment (VADER) ---")
-        fundamental_score = self.fundamental_processor.fetch_realtime_sentiment(self.symbol)
+        # 2. Fetch Latest Fundamental Score
+        print("--- Running Step 2: Fetching Real-Time Fundamental Sentiment ---")
+        fundamental_score = self.fundamental_processor.fetch_realtime_sentiment()
 
-        # 3. Decision Logic and Price Calculation (Unchanged)
+        # 3. Decision Logic and Price Calculation
         signal = "HOLD"
         stop_loss, take_profit = None, None
 
@@ -608,31 +580,26 @@ class SignalGenerator:
             "tp_pips": self.TAKE_PROFIT_PIPS
         }
 
-# --- Main Execution Function (Unchanged) ---
+# --- Main Execution Function ---
 def run_signal_generation_logic():
     """Initializes and runs the signal generation, backtesting, and email process."""
 
-    # Note: We now check for the specific keys we need for the new system.
-    if not TWELVEDATA_API_KEY or not FMP_API_KEY:
-        print("FATAL: Price Data API Keys (TwelveData/FMP) are missing. Cannot fetch data.")
-        return {"signal": "HOLD", "reason": "Missing primary Price Data API Keys."}
-    
-    # We proceed even if news keys are missing, as VADER will default to 0.0, 
-    # but the logs will clearly state the missing keys.
-    if not NEWS_API_KEY_1 and not MARKETAUX_API_KEY:
-        print("WARNING: All News API Keys are missing. Sentiment will be 0.0.")
-    
-    try:
-        # 1. Initialize the new Ensemble Data Feeds
-        market_data_api = ReconcilingDataFeed()
-        # Sentiment Processor now uses VADER
-        sentiment_api = EnsembleFundamentalProcessor(api_key_1=NEWS_API_KEY_1, api_key_2=MARKETAUX_API_KEY)
+    if not TWELVEDATA_API_KEY:
+        print("FATAL: TWELVEDATA_API_KEY environment variable is not set. Exiting.")
+        return {"signal": "HOLD", "reason": "Missing TwelveData API Key."}
+
+    if not MARKETAUX_API_KEY:
+        print("WARNING: MARKETAUX_API_KEY environment variable is not set. Sentiment will be 0.0.")
         
+    try:
+        # 💡 Replaced AlphaVantageDataFeed with TwelveDataFeed
+        market_data_api = TwelveDataFeed(api_key=TWELVEDATA_API_KEY)
+        sentiment_api = MarketAuxProcessor(api_key=MARKETAUX_API_KEY)
         generator = SignalGenerator(data_feed=market_data_api, fundamental_processor=sentiment_api)
 
-        # 2. Initialize historical data (runs once)
+        # 1. Initialize historical data (runs once)
         print("\n" + "="*50)
-        print("### STEP 1: INITIALIZING ENSEMBLE DATA ###")
+        print("### STEP 1: INITIALIZING DATA ###")
         print("="*50)
         generator.initialize_data()
 
@@ -640,7 +607,7 @@ def run_signal_generation_logic():
             print("\nFATAL: Initialization failed. Exiting.")
             return {"signal": "HOLD", "reason": "Historical data initialization failed."}
 
-        # 3. Backtest the predicted signals
+        # 2. Backtest the predicted signals
         print("\n" + "="*50)
         print("### STEP 2: RUNNING BACKTESTING ###")
         print("="*50)
@@ -652,6 +619,7 @@ def run_signal_generation_logic():
             tp_pips=generator.TAKE_PROFIT_PIPS
         )
         backtest_results = backtester.run_backtest()
+        
         print("\n" + "*"*50)
         print("### BACKTEST RESULTS (Using Fixed TP/SL) ###")
         print(f"Total Trades Analyzed: {backtest_results['total_trades']}")
@@ -661,15 +629,15 @@ def run_signal_generation_logic():
         print(f"Details: {backtest_results['reason']}")
         print("*"*50)
 
-        # 4. Run the real-time signal generation
+        # 3. Run the real-time signal generation
         print("\n" + "="*50)
         print("### STEP 3: GENERATING REAL-TIME SIGNAL ###")
         print("="*50 + "\n")
 
         signal_result = generator.generate_signal()
 
-        # 5. Print and Email the result
-        
+        # 4. Print and Email the result
+
         # Create the email content body
         email_body = f"""
 TRADING SIGNAL NOTIFICATION - EUR/USD ({generator.interval})
@@ -725,7 +693,7 @@ REASON: {signal_result['reason']}
 
         return {"signal": "ERROR", "reason": f"Critical runtime error: {e}"}
 
-# --- Flask Routes (Unchanged) ---
+# --- Flask Routes ---
 @app.route('/', methods=['GET'])
 def home():
     """Simple status check endpoint."""
@@ -734,7 +702,7 @@ def home():
 @app.route('/run', methods=['POST', 'GET'])
 def run_script():
     """
-    Endpoint to trigger the trading logic. The logic is run in a separate 
+    Endpoint to trigger the trading logic. The logic is run in a separate
     thread to prevent Gunicorn worker timeouts.
     """
     print("--- Received request to run trading logic (Starting Background Thread) ---")
