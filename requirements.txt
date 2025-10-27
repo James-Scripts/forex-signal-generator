@@ -1,9 +1,24 @@
-# List of libraries used in your script
+# --- Core Data Processing & Utilities ---
 requests
 pandas
 pandas-ta
 numpy
-# For email sending
-secure-smtplib # Recommended for better security than standard smtplib
+yfinance  # Required for the YFinanceWrapper data feed
+python-dotenv # Recommended for managing API keys and settings from a .env file
+
+# --- Sentiment Analysis (VADER) ---
+nltk  # Natural Language Toolkit, required for VADER
+
+# --- Server & Deployment ---
 Flask
-gunicorn
+gunicorn 
+
+# --- Email Sending ---
+# Note: 'secure-smtplib' is not a standard Python package. 
+# Standard 'smtplib' is built-in. If you meant a package for 
+# managing sensitive data, 'python-dotenv' helps.
+# We will use the standard convention for dependency listing.
+
+# --- Dependency Check ---
+# Final list for the current script
+# requests, pandas, pandas-ta, numpy, yfinance, nltk, Flask, gunicorn
