@@ -1,9 +1,8 @@
-Flask==3.0.0
-gunicorn==20.1.0
-requests==2.32.3
-# Pinning to a stable version for Python 3.10/3.11 compatibility
-pandas==2.2.2 
-# Updated pandas-ta to a newer version to resolve compatibility issues on Python 3.10
-pandas-ta==0.3.14c0 
-numpy==1.26.4
-nltk==3.8.1
+
+Flask==3.0.0,
+gunicorn==20.1.0,
+requests==2.32.3,
+pandas==2.2.2,
+"pandas-ta>=0.3.0,<0.4.0",
+numpy==1.26.4,
+nltk==3.8.1,
