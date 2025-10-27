@@ -18,16 +18,37 @@ from flask import Flask, jsonify, request
 
 # --- 💡 NLTK & VADER for NewsAPI Sentiment ---
 import nltk
-# Ensure VADER lexicon is available (uncomment the next line if you get a Resource NLTK error)
-# try:
-#     nltk.data.find('sentiment/vader_lexicon.zip')
-# except nltk.downloader.DownloadError:
-#     nltk.download('vader_lexicon')
+import ssl # Import for SSL fix
+
+# --- CRITICAL FIX: NLTK Data Download for Deployment ---
+# 1. Handle potential SSL issues on deployment platforms
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    # If the function is not available (e.g., Python 2), proceed
+    pass
+else:
+    # Otherwise, unverify the context to allow download to work
+    ssl._create_default_https_context = _create_unverified_https_context
+
+# 2. Download the required lexicon data
+try:
+    # Check if the lexicon is already available
+    nltk.data.find('sentiment/vader_lexicon.zip')
+except nltk.downloader.DownloadError:
+    # If not found, download it. This is the fix for the traceback error.
+    print("NLTK vader_lexicon not found, downloading...")
+    nltk.download('vader_lexicon')
+except LookupError:
+    # Catching LookupError if the data is not found locally
+    print("NLTK vader_lexicon not found, downloading...")
+    nltk.download('vader_lexicon')
+# -----------------------------------------------------
+
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # --- Flask Application Setup ---
 app = Flask(__name__)
-
 # --- API Keys Configuration ---
 # ⚠️ SECURITY NOTE: The raw keys you provided (7ded66b4..., A0xuQ94t..., a3427bc1..., 7ec3a80c...)
 # have been replaced with secure environment variable lookups. 
