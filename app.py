@@ -1,7 +1,7 @@
 import requests
 import pandas as pd
 import pandas_ta as ta
-import yfinance as yf # NEW: Added yfinance
+import yfinance as yf 
 from datetime import datetime, timedelta
 import time
 import json
@@ -18,23 +18,30 @@ from threading import Thread
 # 💡 Flask Imports
 from flask import Flask, jsonify, request
 
+# --- NLP Imports for Sentiment Analysis (NEW) ---
+import nltk
+from nltk.sentiment.vader import SentimentIntensityAnalyzer 
+
+# NOTE: For the script to run, ensure you have the 'vader_lexicon' downloaded.
+# Run this once in your terminal or Python environment: 
+# import nltk; nltk.download('vader_lexicon')
+
 # --- Flask Application Setup ---
 app = Flask(__name__)
 
 # ==============================================================================
-# 0. API Keys & Configuration (Updated for New APIs)
+# 0. API Keys & Configuration (Unchanged)
 # ==============================================================================
 
-# --- PRICE DATA KEYS (Replacing Alpha Vantage) ---
+# --- PRICE DATA KEYS ---
 TWELVEDATA_API_KEY = "7ded66b4a2184314a57abd4f8f6b304b"
 FMP_API_KEY = "A0xuQ94tqyjfAKitVIGoNKPNnBX2K0JT"
-# FOREXRATE_API_KEY is available but not integrated into the OHLC ensemble for simplicity.
 
-# --- NEWS DATA KEYS (Combining the new one with the existing MarketAux) ---
-NEWS_API_KEY_1 = "7ec3a80cd7564d2c8652cd2ec6b83c14" # The new news API key
+# --- NEWS DATA KEYS ---
+NEWS_API_KEY_1 = "7ec3a80cd7564d2c8652cd2ec6b83c14" 
 MARKETAUX_API_KEY = os.environ.get("MARKETAUX_API_KEY") # Keeping MarketAux as an environment variable
 
-# --- EMAIL Configuration (Using environment variables as before) ---
+# --- EMAIL Configuration ---
 MAIL_USERNAME = os.environ.get("MAIL_USERNAME")
 MAIL_PASSWORD = os.environ.get("MAIL_PASSWORD")
 MAIL_SERVER = os.environ.get("MAIL_SERVER", 'smtp.gmail.com')
@@ -72,7 +79,7 @@ def send_email_notification(subject: str, body: str, recipient: str):
         print(f"FATAL EMAIL ERROR: Failed to send email: {e}")
 
 # ==============================================================================
-# 1. ENSEMBLE DATA FEED (Replaces AlphaVantageDataFeed)
+# 1. ENSEMBLE DATA FEED (Unchanged)
 # ==============================================================================
 
 class DataAPIWrapper:
@@ -86,7 +93,7 @@ class TwelveDataWrapper(DataAPIWrapper):
         url = "https://api.twelvedata.com/time_series"
         params = {
             "symbol": symbol,
-            "interval": '1h', # TwelveData uses '1h'
+            "interval": '1h', 
             "apikey": TWELVEDATA_API_KEY,
             "outputsize": 500,
             "timezone": "exchange",
@@ -177,8 +184,6 @@ class ReconcilingDataFeed:
         print(f"DEBUG: Successfully reconciled data from {len(valid_data)} sources. Total bars: {len(self.data_cache[symbol])}")
         return self.data_cache[symbol].copy()
 
-    # NOTE: fetch_realtime_bar is removed. The SignalGenerator will handle the latest bar update
-    # by fetching the latest close price from the full reconciled dataset.
     def fetch_latest_bar(self, symbol: str) -> pd.Series:
         """Retrieves the latest bar from the cached historical data."""
         if symbol in self.data_cache and not self.data_cache[symbol].empty:
@@ -187,24 +192,33 @@ class ReconcilingDataFeed:
     
 
 # ==============================================================================
-# 2. FUNDAMENTAL PROCESSOR (Replaces MarketAuxProcessor)
+# 2. FUNDAMENTAL PROCESSOR (UPDATED for VADER)
 # ==============================================================================
 
 class EnsembleFundamentalProcessor:
-    """Fetches and combines sentiment from multiple news APIs."""
+    """Fetches and combines sentiment from multiple news APIs using VADER NLP."""
 
     def __init__(self, api_key_1: str, api_key_2: Optional[str]):
-        # API 1: The new newsapi.org key
         self.api_key_1 = api_key_1
-        # API 2: The existing MarketAux key
         self.api_key_2 = api_key_2
+        # Initialize VADER Sentiment Analyzer (NEW)
+        self.vader = SentimentIntensityAnalyzer()
+
+
+    def _analyze_sentiment(self, text: str) -> float:
+        """Calculates VADER compound score for a given text."""
+        if not text:
+            return 0.0
+        # The compound score is the normalized, weighted composite score (-1 to +1)
+        return self.vader.polarity_scores(text)['compound']
+
 
     def fetch_realtime_sentiment(self, symbol: str = SYMBOL) -> float:
-        """Fetches the latest financial news sentiment."""
+        """Fetches the latest financial news sentiment from multiple sources."""
         
         scores = []
         
-        # --- Source 1: New News API (Placeholder for NLP) ---
+        # --- Source 1: News API (VADER Integration) ---
         url_1 = "https://newsapi.org/v2/everything"
         params_1 = {
             "q": f"forex {symbol}",
@@ -213,23 +227,35 @@ class EnsembleFundamentalProcessor:
             "apiKey": self.api_key_1,
             "pageSize": 25
         }
-        try:
-            response_1 = requests.get(url_1, params=params_1, timeout=5).json()
-            articles_1 = response_1.get('articles', [])
-            if articles_1:
-                 # NOTE: A real system requires NLP. This is a random score PLACEHOLDER.
-                 score_1 = np.random.uniform(-1, 1) 
-                 scores.append(score_1)
-                 print(f"Source 1 (News API): Fetched {len(articles_1)} articles. Placeholder Score: {score_1:.2f}")
-        except Exception:
-            print("Source 1 (News API) failed to fetch.")
+        
+        if self.api_key_1:
+            try:
+                response_1 = requests.get(url_1, params=params_1, timeout=5).json()
+                articles_1 = response_1.get('articles', [])
+                article_scores = []
 
-        # --- Source 2: MarketAux Processor (Existing Logic) ---
+                for article in articles_1:
+                    # Combine title and description for a richer text analysis
+                    text = f"{article.get('title', '')} {article.get('description', '')}"
+                    score = self._analyze_sentiment(text)
+                    if score != 0.0:
+                        article_scores.append(score)
+                
+                if article_scores:
+                    score_1 = np.mean(article_scores)
+                    scores.append(score_1)
+                    print(f"Source 1 (News API): Analyzed {len(article_scores)} articles. Average VADER Score: {score_1:.2f}")
+
+            except Exception as e:
+                print(f"Source 1 (News API) failed to fetch or process: {e}")
+
+        # --- Source 2: MarketAux Processor (VADER Integration) ---
         if self.api_key_2:
             url_2 = "https://api.marketaux.com/v1/news/all"
+            # Focusing the search on the currency pair
             params_2 = {
                 "api_token": self.api_key_2,
-                "search": "euro OR dollar OR eur/usd",
+                "search": "euro OR dollar OR eur/usd", 
                 "filter_entities": "true",
                 "language": "en",
                 "limit": 10
@@ -237,40 +263,40 @@ class EnsembleFundamentalProcessor:
             try:
                 response_2 = requests.get(url_2, params=params_2, timeout=5).json()
                 articles_2 = response_2.get('data', [])
-                all_sentiments = []
+                article_scores = []
+
                 for article in articles_2:
-                    entities = article.get('entities', [])
-                    for entity in entities:
-                        if entity.get('symbol') in ['EUR', 'USD'] and 'sentiment_score' in entity:
-                            score = entity['sentiment_score']
-                            # Weight EUR sentiment positively, USD sentiment negatively
-                            all_sentiments.append(score if entity['symbol'] == 'EUR' else -score) 
+                    # Combine snippet and title for VADER analysis
+                    text = f"{article.get('title', '')} {article.get('snippet', '')}"
+                    
+                    # Instead of complex entity-based math, use the overall article VADER score
+                    score = self._analyze_sentiment(text)
+                    if score != 0.0:
+                        article_scores.append(score)
                 
-                if all_sentiments:
-                    score_2 = sum(all_sentiments) / len(all_sentiments)
+                if article_scores:
+                    score_2 = np.mean(article_scores)
                     scores.append(score_2)
-                    print(f"Source 2 (MarketAux): Calculated Score: {score_2:.2f}")
+                    print(f"Source 2 (MarketAux): Analyzed {len(article_scores)} snippets. Average VADER Score: {score_2:.2f}")
                 
-            except Exception:
-                print("Source 2 (MarketAux) failed to fetch.")
+            except Exception as e:
+                print(f"Source 2 (MarketAux) failed to fetch or process: {e}")
 
         if not scores:
+            print("WARNING: No valid news scores retrieved from any source. Sentiment defaulted to 0.0.")
             return 0.0
             
-        # Return the average of all successful sources
+        # Return the simple average of all successful sources' average scores
         avg_sentiment = sum(scores) / len(scores)
         return avg_sentiment
 
 
 # ==============================================================================
-# 3. TRADING STRATEGY AND SIGNAL GENERATION (Modified)
+# 3. TRADING STRATEGY AND SIGNAL GENERATION (Unchanged Logic)
 # ==============================================================================
 
-# Backtester and SignalGenerator classes are kept mostly intact, 
-# but SignalGenerator is updated to use the new data sources.
-
 class Backtester:
-    # ... (CLASS CONTENT IS UNCHANGED - uses existing data structure) ...
+    # ... (CLASS CONTENT IS UNCHANGED) ...
     """
     Implements the backtesting of the MACD + Stochastic + Fundamental strategy with
     fixed Take Profit (TP) and Stop Loss (SL).
@@ -303,6 +329,8 @@ class Backtester:
         Generates buy/sell/hold signals based on technical and simulated fundamental data.
         """
         # SIMULATION: Create a synthetic historical sentiment series.
+        # This simulation remains for backtesting purposes. 
+        # For LIVE signals, the real sentiment from VADER is used.
         np.random.seed(42)
         price_diff = self.data['close'].diff().fillna(0)
         simulated_sentiment = np.clip(price_diff.rolling(window=10).mean().fillna(0) * 5 + np.random.normal(0, 0.1, len(self.data)), -1, 1)
@@ -437,6 +465,7 @@ class Backtester:
         }
 
 class SignalGenerator:
+    # ... (CLASS CONTENT IS UNCHANGED) ...
     # --- Strategy Tuning Parameters ---
     MACD_FAST = 12
     MACD_SLOW = 26
@@ -456,14 +485,13 @@ class SignalGenerator:
         self.fundamental_processor = fundamental_processor
         self.symbol = SYMBOL
         self.interval = INTERVAL
-        self.lookback_years = 2 # Used as a proxy in the new fetcher
+        self.lookback_years = 2 
         self.data: Optional[pd.DataFrame] = None
 
     def initialize_data(self):
         """Fetches historical data to build the model's foundation using the ReconcilingDataFeed."""
         print(f"\n--- Initializing Historical Data for {self.symbol} ---")
 
-        # Key check is now handled by the ReconcilingDataFeed's internal wrappers
         self.data = self.data_feed.fetch_historical_data(self.symbol, self.interval, self.lookback_years)
 
         if self.data is not None and not self.data.empty:
@@ -505,15 +533,11 @@ class SignalGenerator:
             return {"signal": "HOLD", "reason": "Historical data missing."}
 
         # 1. Fetch Latest Bar (Using the latest bar from the reconciled dataset)
-        # This simplifies the real-time logic since all data is already reconciled.
         print("\n--- Running Step 1: Fetching Latest Market Data from Reconciled Set ---")
-        new_bar = self.data_feed.fetch_latest_bar(self.symbol) # Use the latest bar in the set
+        new_bar = self.data_feed.fetch_latest_bar(self.symbol) 
 
         if new_bar.empty:
             return {"signal": "HOLD", "reason": "Failed to fetch real-time bar."}
-
-        # Since we use the latest reconciled bar, we ensure the index matches the last row's index
-        # We don't need to append/recalculate as the bar is already the latest in the set.
         
         # Get latest and previous data points
         if len(self.data) < 2:
@@ -527,8 +551,8 @@ class SignalGenerator:
         prev_stoch_k = prev_data['Stoch_K']
         prev_stoch_d = prev_data['Stoch_D']
 
-        # 2. Fetch Latest Fundamental Score (Using the combined processor)
-        print("--- Running Step 2: Fetching Real-Time Fundamental Sentiment ---")
+        # 2. Fetch Latest Fundamental Score (Now using VADER)
+        print("--- Running Step 2: Fetching Real-Time Fundamental Sentiment (VADER) ---")
         fundamental_score = self.fundamental_processor.fetch_realtime_sentiment(self.symbol)
 
         # 3. Decision Logic and Price Calculation (Unchanged)
@@ -584,7 +608,7 @@ class SignalGenerator:
             "tp_pips": self.TAKE_PROFIT_PIPS
         }
 
-# --- Main Execution Function (Modified Initialization) ---
+# --- Main Execution Function (Unchanged) ---
 def run_signal_generation_logic():
     """Initializes and runs the signal generation, backtesting, and email process."""
 
@@ -593,12 +617,15 @@ def run_signal_generation_logic():
         print("FATAL: Price Data API Keys (TwelveData/FMP) are missing. Cannot fetch data.")
         return {"signal": "HOLD", "reason": "Missing primary Price Data API Keys."}
     
+    # We proceed even if news keys are missing, as VADER will default to 0.0, 
+    # but the logs will clearly state the missing keys.
     if not NEWS_API_KEY_1 and not MARKETAUX_API_KEY:
         print("WARNING: All News API Keys are missing. Sentiment will be 0.0.")
     
     try:
         # 1. Initialize the new Ensemble Data Feeds
         market_data_api = ReconcilingDataFeed()
+        # Sentiment Processor now uses VADER
         sentiment_api = EnsembleFundamentalProcessor(api_key_1=NEWS_API_KEY_1, api_key_2=MARKETAUX_API_KEY)
         
         generator = SignalGenerator(data_feed=market_data_api, fundamental_processor=sentiment_api)
