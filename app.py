@@ -349,8 +349,8 @@ class Backtester:
         Executes the backtest using the fixed TP/SL logic and calculates performance metrics.
         """
         # FIX: Ensure a complete error dictionary is returned if data is missing
-        if self.data.empty or 'signal' not in self.data.columns:
-            return {"net_pips": 0, "total_trades": 0, "winning_trades": 0, "profit_factor": 0.0, "reason": "Data or signal generation failed."}
+        if self.data.empty:
+            return {"net_pips": 0, "total_trades": 0, "winning_trades": 0, "profit_factor": 0.0, "reason": "Initial data is empty."}
             
         self.calculate_technical_indicators()
         self.generate_historical_signals()
@@ -647,13 +647,15 @@ def run_signal_generation_logic():
         backtest_results = backtester.run_backtest()
         print("\n" + "*"*50)
         print("### BACKTEST RESULTS (Using Fixed TP/SL) ###")
-        # The backtest_results dictionary is now guaranteed to have 'winning_trades' 
-        # even if total_trades is 0, thanks to the fix in Backtester.
-        print(f"Total Trades Analyzed: {backtest_results['total_trades']}")
-        print(f"Winning Trades: {backtest_results['winning_trades']}")
-        print(f"Net Pips Gained: **{backtest_results['net_pips']:.2f}**")
-        print(f"Profit Factor: **{backtest_results['profit_factor']:.2f}**")
-        print(f"Details: {backtest_results['reason']}")
+        
+        # --- FIX: Using .get() for safe printing of backtest results ---
+        print(f"Total Trades Analyzed: {backtest_results.get('total_trades', 0)}")
+        print(f"Winning Trades: {backtest_results.get('winning_trades', 0)}")
+        print(f"Net Pips Gained: **{backtest_results.get('net_pips', 0.0):.2f}**")
+        print(f"Profit Factor: **{backtest_results.get('profit_factor', 0.0):.2f}**")
+        print(f"Details: {backtest_results.get('reason', 'Unknown failure.')}")
+        # -----------------------------------------------------------
+        
         print("*"*50)
 
         # 3. Run the real-time signal generation
