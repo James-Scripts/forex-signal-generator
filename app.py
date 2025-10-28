@@ -20,10 +20,10 @@ from flask import Flask, jsonify, request
 # --- Flask Application Setup ---
 app = Flask(__name__)
 # --- API Keys Configuration ---
-# REMOVED: ALPHA_VANTAGE_API_KEY
-TWELVESDATA_API_KEY = os.environ.get("TWELVESDATA_API_KEY", "7ded66b4a2184314a57abd4f8f6b304b") # Replaced Alpha Vantage
-FMP_API_KEY = os.environ.get("FMP_API_KEY", "A0xuQ94tqyjfAKitVIGoNKPNR2K0JT") # Not used for data, but kept in config if needed later
-FOREXRATE_API_KEY = os.environ.get("FOREXRATE_API_KEY", "a3427bc18e048bc3da875a7dc3d90751") # Not used for data, but kept in config if needed later
+# NOTE: The keys below should be set as environment variables on your Render server. 
+TWELVESDATA_API_KEY = os.environ.get("TWELVESDATA_API_KEY", "7ded66b4a2184314a57abd4f8f6b304b") # Primary Data Feed
+FMP_API_KEY = os.environ.get("FMP_API_KEY", "A0xuQ94tqyjfAKitVIGoNKPNR2K0JT") # Included but not used in this version
+FOREXRATE_API_KEY = os.environ.get("FOREXRATE_API_KEY", "a3427bc18e048bc3da875a7dc3d90751") # Included but not used in this version
 MARKETAUX_API_KEY = os.environ.get("MARKETAUX_API_KEY") 
 NEW_NEWS_API_KEY = os.environ.get("NEW_NEWS_API_KEY", "7ec3a80cd7564d2c8652cd2ec6b83c14") # New secondary news source
 # --- EMAIL Configuration ---
@@ -81,8 +81,7 @@ class TwelvesDataFeed(DataFeed):
             print(f"DEBUG: Historical Data for {symbol} loaded from cache.")
             return self.data_cache[symbol].copy()
 
-        # Twelves Data defaults to 5000 max points, which is roughly a year of 60min data
-        # We request 5000 points to get the maximum history possible.
+        # Twelves Data defaults to 5000 max points.
         params = {
             "symbol": symbol,
             "interval": interval,
@@ -457,7 +456,7 @@ class SignalGenerator:
         self.data_feed = data_feed
         self.fundamental_processor = fundamental_processor
         self.symbol = "EUR/USD"
-        self.interval = "60min"
+        self.interval = "1h" # <-- FIX: Changed from "60min" to "1h" for Twelves Data API compatibility
         self.lookback_years = 2
         self.data: Optional[pd.DataFrame] = None
     def initialize_data(self):
