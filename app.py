@@ -348,11 +348,17 @@ class Backtester:
         """
         Executes the backtest using the fixed TP/SL logic and calculates performance metrics.
         """
+        # FIX: Ensure a complete error dictionary is returned if data is missing
+        if self.data.empty or 'signal' not in self.data.columns:
+            return {"net_pips": 0, "total_trades": 0, "winning_trades": 0, "profit_factor": 0.0, "reason": "Data or signal generation failed."}
+            
         self.calculate_technical_indicators()
         self.generate_historical_signals()
 
         if self.data.empty or 'signal' not in self.data.columns:
-            return {"net_pips": 0, "total_trades": 0, "profit_factor": 0.0, "reason": "Data or signal generation failed."}
+            # Re-check after calculation/signal generation
+            return {"net_pips": 0, "total_trades": 0, "winning_trades": 0, "profit_factor": 0.0, "reason": "Data or signal generation failed after indicators/signals."}
+            
         trades_list = []
         in_trade = False
 
@@ -423,8 +429,10 @@ class Backtester:
         trades_df = pd.DataFrame(trades_list)
         total_trades = len(trades_df)
 
+        # FIX: Ensure a complete error dictionary is returned even if total_trades is zero
         if total_trades == 0:
-            return {"net_pips": 0, "total_trades": 0, "profit_factor": 0.0, "reason": "No completed trades generated."}
+            return {"net_pips": 0, "total_trades": 0, "winning_trades": 0, "profit_factor": 0.0, "reason": "No completed trades generated."}
+            
         total_profit = trades_df[trades_df['profit_pips'] > 0]['profit_pips'].sum()
         total_loss = trades_df[trades_df['profit_pips'] < 0]['profit_pips'].sum()
         net_pips = total_profit + total_loss
@@ -456,7 +464,7 @@ class SignalGenerator:
         self.data_feed = data_feed
         self.fundamental_processor = fundamental_processor
         self.symbol = "EUR/USD"
-        self.interval = "1h" # <-- FIX: Changed from "60min" to "1h" for Twelves Data API compatibility
+        self.interval = "1h" # <-- CORRECTED interval for Twelves Data API
         self.lookback_years = 2
         self.data: Optional[pd.DataFrame] = None
     def initialize_data(self):
@@ -639,6 +647,8 @@ def run_signal_generation_logic():
         backtest_results = backtester.run_backtest()
         print("\n" + "*"*50)
         print("### BACKTEST RESULTS (Using Fixed TP/SL) ###")
+        # The backtest_results dictionary is now guaranteed to have 'winning_trades' 
+        # even if total_trades is 0, thanks to the fix in Backtester.
         print(f"Total Trades Analyzed: {backtest_results['total_trades']}")
         print(f"Winning Trades: {backtest_results['winning_trades']}")
         print(f"Net Pips Gained: **{backtest_results['net_pips']:.2f}**")
