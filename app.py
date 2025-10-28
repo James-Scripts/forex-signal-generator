@@ -20,8 +20,12 @@ from flask import Flask, jsonify, request
 # --- Flask Application Setup ---
 app = Flask(__name__)
 # --- API Keys Configuration ---
-ALPHA_VANTAGE_API_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY")
-MARKETAUX_API_KEY = os.environ.get("MARKETAUX_API_KEY")
+# REMOVED: ALPHA_VANTAGE_API_KEY
+TWELVESDATA_API_KEY = os.environ.get("TWELVESDATA_API_KEY", "7ded66b4a2184314a57abd4f8f6b304b") # Replaced Alpha Vantage
+FMP_API_KEY = os.environ.get("FMP_API_KEY", "A0xuQ94tqyjfAKitVIGoNKPNR2K0JT") # Not used for data, but kept in config if needed later
+FOREXRATE_API_KEY = os.environ.get("FOREXRATE_API_KEY", "a3427bc18e048bc3da875a7dc3d90751") # Not used for data, but kept in config if needed later
+MARKETAUX_API_KEY = os.environ.get("MARKETAUX_API_KEY") 
+NEW_NEWS_API_KEY = os.environ.get("NEW_NEWS_API_KEY", "7ec3a80cd7564d2c8652cd2ec6b83c14") # New secondary news source
 # --- EMAIL Configuration ---
 MAIL_USERNAME = os.environ.get("MAIL_USERNAME")
 MAIL_PASSWORD = os.environ.get("MAIL_PASSWORD")
@@ -31,7 +35,7 @@ MAIL_SENDER = os.environ.get("MAIL_SENDER")
 MAIL_RECIPIENT = os.environ.get("MAIL_RECIPIENT")
 # --- 0. Email Utility Function ---
 def send_email_notification(subject: str, body: str, recipient: str):
-    """Sends an email using the configured SMTP settings.""" # <-- INDENTATION FIXED
+    """Sends an email using the configured SMTP settings.""" 
     if not all([MAIL_USERNAME, MAIL_PASSWORD, MAIL_SENDER, recipient]):
         print("ERROR: Email configuration missing. Skipping email notification.")
         return
@@ -51,128 +55,109 @@ def send_email_notification(subject: str, body: str, recipient: str):
         print("FATAL EMAIL ERROR: SMTP Authentication failed. Check your username and App Password.")
     except Exception as e:
         print(f"FATAL EMAIL ERROR: Failed to send email: {e}")
-# --- 1. Data Feed (Alpha Vantage) (Updated for robust data validation) ---
+# --- 1. Data Feed (Twelves Data) ---
 class DataFeed:
     """Base class for fetching both historical and real-time market data."""
     def fetch_historical_data(self, symbol: str, interval: str, lookback_years: int) -> pd.DataFrame:
         raise NotImplementedError
     def fetch_realtime_bar(self, symbol: str, interval: str) -> pd.Series:
         raise NotImplementedError
-class AlphaVantageDataFeed(DataFeed):
-    BASE_URL = "https://www.alphavantage.co/query"
-    TIME_INTERVAL = "60min"
 
+class TwelvesDataFeed(DataFeed):
+    """New data feed using Twelves Data API."""
+    BASE_URL = "https://api.twelvedata.com"
+    
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.data_cache = {}
+
     def fetch_historical_data(self, symbol: str, interval: str, lookback_years: int) -> pd.DataFrame:
         """
-        Fetches up to 2 years of 60min historical Forex data for EUR/USD.
-
-        Now includes robust checks to prevent 'Length mismatch' errors.
+        Fetches historical Forex data using Twelves Data. Limited to 5000 points.
         """
-
-        from_symbol, to_symbol = symbol[:3], symbol[4:]
+        print(f"DEBUG: Fetching historical {interval} data for {symbol} (Twelves Data)...")
 
         if symbol in self.data_cache:
             print(f"DEBUG: Historical Data for {symbol} loaded from cache.")
             return self.data_cache[symbol].copy()
 
-        print(f"DEBUG: Fetching historical {interval} data for {symbol} (up to 2 years)...")
-
-        slices = [f"year{y}month{m}" for y in [1, 2] for m in range(1, 13)]
-        all_data = []
-
-        for i, slice_name in enumerate(slices):
-            if i > 0:
-                print(f"DEBUG: Pausing for 15 seconds after slice {i+1} to respect Alpha Vantage rate limit...")
-                time.sleep(15)
-            params = {
-                "function": "FX_INTRADAY_EXTENDED",
-                "from_symbol": from_symbol,
-                "to_symbol": to_symbol,
-                "interval": interval,
-                "slice": slice_name,
-                "outputsize": "full",
-                "apikey": self.api_key,
-                "datatype": "csv"
-            }
-
-            try:
-                response = requests.get(self.BASE_URL, params=params, timeout=30)
-                response.raise_for_status()
-                if 'Error Message' in response.text or 'Invalid API call' in response.text:
-                    print(f"Alpha Vantage API Error for {slice_name}: {response.text.strip()}")
-                    continue
-                df_slice = pd.read_csv(StringIO(response.text))
-
-                # 💡 FIX 1: Crucial check: only append if it looks like correct data (must have 6 columns)
-                if len(df_slice.columns) == 6:
-                    all_data.append(df_slice)
-                    print(f"DEBUG: Fetched slice: {slice_name} ({len(df_slice)} rows)")
-                else:
-                    print(f"WARNING: Slice {slice_name} was filtered out due to unexpected column count ({len(df_slice.columns)} instead of 6).")
-            except requests.exceptions.RequestException as e:
-                print(f"API request failed for slice {slice_name}: {e}")
-                time.sleep(60)
-                continue
-            except Exception as e:
-                print(f"Failed to process slice {slice_name}: {e}")
-                continue
-        if not all_data:
-            print("ERROR: Failed to fetch any valid historical data slices.")
-            return pd.DataFrame()
-        full_df = pd.concat(all_data, ignore_index=True)
-
-        # 💡 FIX 2: Check column count on final concatenated DataFrame before assigning names
-        if len(full_df.columns) != 6:
-            print(f"FATAL ERROR: Final concatenated DataFrame has {len(full_df.columns)} columns, expected 6. Returning empty DataFrame.")
-            return pd.DataFrame()
-        full_df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-
-        full_df['timestamp'] = pd.to_datetime(full_df['timestamp'])
-        full_df.set_index('timestamp', inplace=True)
-        full_df.sort_index(inplace=True)
-        full_df = full_df[~full_df.index.duplicated(keep='first')]
-        full_df.dropna(inplace=True)
-        self.data_cache[symbol] = full_df.drop(columns=['volume'])
-        return self.data_cache[symbol].copy()
-    def fetch_realtime_bar(self, symbol: str, interval: str) -> pd.Series:
-        """
-        Fetches the latest intraday bar data.
-        """
-        from_symbol, to_symbol = symbol[:3], symbol[4:]
-
+        # Twelves Data defaults to 5000 max points, which is roughly a year of 60min data
+        # We request 5000 points to get the maximum history possible.
         params = {
-            "function": "FX_INTRADAY",
-            "from_symbol": from_symbol,
-            "to_symbol": to_symbol,
+            "symbol": symbol,
             "interval": interval,
-            "outputsize": "compact",
+            "outputsize": 5000,
             "apikey": self.api_key
         }
+
+        # Use time series endpoint
+        url = f"{self.BASE_URL}/time_series"
+
         try:
-            response = requests.get(self.BASE_URL, params=params)
+            response = requests.get(url, params=params, timeout=30)
             response.raise_for_status()
             data = response.json()
 
-            time_series_key = f"Time Series FX ({interval})"
+            if data.get('status') == 'error':
+                print(f"Twelves Data API Error: {data.get('message')}")
+                return pd.DataFrame()
+            
+            if 'values' not in data:
+                print("Twelves Data: No historical data returned.")
+                return pd.DataFrame()
+                
+            df = pd.DataFrame(data['values'])
+            df.rename(columns={'datetime': 'timestamp'}, inplace=True)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            
+            # Convert OHLC columns to float, dropping 'volume' since it's often unreliable for Forex
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            df.set_index('timestamp', inplace=True)
+            df.sort_index(inplace=True)
+            df.dropna(inplace=True)
+            
+            self.data_cache[symbol] = df[['open', 'high', 'low', 'close']]
+            print(f"DEBUG: Historical Data loaded. Total bars: {len(df)}")
+            return self.data_cache[symbol].copy()
 
-            if time_series_key not in data:
-                error_msg = data.get('Error Message', 'Unknown error structure in response.')
-                if "Thank you for using Alpha Vantage" in str(data):
-                    print("Alpha Vantage rate limit hit. Pausing and returning empty series.")
-                    time.sleep(60)
+        except requests.exceptions.RequestException as e:
+            print(f"Twelves Data historical request failed: {e}")
+            return pd.DataFrame()
+
+    def fetch_realtime_bar(self, symbol: str, interval: str) -> pd.Series:
+        """
+        Fetches the latest intraday bar data using Twelves Data.
+        """
+        print(f"DEBUG: Fetching real-time bar for {symbol} (Twelves Data)...")
+
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "outputsize": 1,
+            "apikey": self.api_key
+        }
+        url = f"{self.BASE_URL}/time_series"
+        
+        try:
+            response = requests.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get('status') == 'error' or 'values' not in data or not data['values']:
+                error_msg = data.get('message', 'No real-time bar returned.')
                 print(f"ERROR fetching real-time bar: {error_msg}")
                 return pd.Series()
 
-            latest_time = list(data[time_series_key].keys())[0]
-            bar_data = data[time_series_key][latest_time]
+            latest_data = data['values'][0]
+            latest_time = latest_data['datetime']
+            
             latest_bar = pd.Series({
-                'open': float(bar_data['1. open']),
-                'high': float(bar_data['2. high']),
-                'low': float(bar_data['3. low']),
-                'close': float(bar_data['4. close'])
+                'open': float(latest_data['open']),
+                'high': float(latest_data['high']),
+                'low': float(latest_data['low']),
+                'close': float(latest_data['close'])
             }, name=pd.to_datetime(latest_time))
 
             return latest_bar
@@ -182,68 +167,121 @@ class AlphaVantageDataFeed(DataFeed):
         except Exception as e:
             print(f"Failed to process real-time data: {e}")
             return pd.Series()
-# --- 2. Fundamental Processor (MarketAux) ---
+
+# --- 2. Fundamental Processor (MarketAux + New News API) ---
 class FundamentalProcessor:
     """Base class for fetching fundamental/sentiment data."""
     def fetch_realtime_sentiment(self) -> float:
         raise NotImplementedError
-class MarketAuxProcessor(FundamentalProcessor):
-    BASE_URL = "https://api.marketaux.com/v1/news/all"
 
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-    def fetch_realtime_sentiment(self) -> float:
-        """Fetches the latest financial news sentiment relevant to EUR/USD."""
+class MultiSourceSentimentProcessor(FundamentalProcessor):
+    """
+    Combines sentiment from MarketAux and the new News API for a more robust fundamental signal.
+    """
+    MARKETAUX_URL = "https://api.marketaux.com/v1/news/all"
+    NEWS_API_URL = "https://newsapi.org/v2/everything" # New News API Endpoint
+
+    def __init__(self, marketaux_key: str, news_api_key: str):
+        self.marketaux_key = marketaux_key
+        self.news_api_key = news_api_key
+
+    def _get_marketaux_sentiment(self) -> List[float]:
+        """Fetches sentiment from MarketAux, weighted for EUR/USD."""
+        
+        if not self.marketaux_key:
+            print("MarketAux key missing. Skipping MarketAux fetch.")
+            return []
 
         params = {
-            "api_token": self.api_key,
+            "api_token": self.marketaux_key,
             "search": "euro OR dollar OR eur/usd",
             "filter_entities": "true",
             "language": "en",
             "limit": 10
         }
         try:
-            response = requests.get(self.BASE_URL, params=params)
+            response = requests.get(self.MARKETAUX_URL, params=params)
             response.raise_for_status()
             data = response.json()
-
             articles = data.get('data', [])
-
-            if not articles:
-                print("MarketAux: No news articles found for search query.")
-                return 0.0
-            all_sentiments = []
-
+            sentiments = []
+            
             for article in articles:
                 entities = article.get('entities', [])
                 for entity in entities:
                     if entity.get('symbol') in ['EUR', 'USD'] and 'sentiment_score' in entity:
                         score = entity['sentiment_score']
                         # Weight EUR sentiment positively, USD sentiment negatively
-                        if entity['symbol'] == 'EUR':
-                            all_sentiments.append(score)
-                        elif entity['symbol'] == 'USD':
-                            all_sentiments.append(-score) # Negative weight for USD sentiment
-            if not all_sentiments:
-                # Fallback to article-level sentiment if entity-level is missing
-                article_sentiments = [
-                    a.get('sentiment_score', 0.0) 
-                    for a in articles if 'sentiment_score' in a
-                ]
-                if article_sentiments:
-                    print("MarketAux: Using article-level sentiment (treating as EUR/USD composite).")
-                    return sum(article_sentiments) / len(article_sentiments)
-                else:
-                    return 0.0
-            avg_sentiment = sum(all_sentiments) / len(all_sentiments)
-
-            return avg_sentiment
-        except requests.exceptions.RequestException as e:
-            print(f"MarketAux request failed: {e}")
-            return 0.0
+                        sentiments.append(score if entity['symbol'] == 'EUR' else -score)
+            
+            print(f"MarketAux: Found {len(sentiments)} entity sentiments.")
+            return sentiments
         except Exception as e:
-            print(f"Failed to process MarketAux data: {e}")
+            print(f"MarketAux request failed: {e}")
+            return []
+
+    def _get_newsapi_sentiment(self) -> List[float]:
+        """Fetches news titles from the new API for external analysis."""
+        
+        if not self.news_api_key:
+            print("New News API key missing. Skipping News API fetch.")
+            return []
+            
+        params = {
+            "apiKey": self.news_api_key,
+            "q": "(EUR OR USD) AND (Forex OR exchange rate)",
+            "language": "en",
+            "sortBy": "publishedAt",
+            "pageSize": 10
+        }
+        try:
+            response = requests.get(self.NEWS_API_URL, params=params)
+            response.raise_for_status()
+            data = response.json()
+            articles = data.get('articles', [])
+            
+            # Simple heuristic: Count positive vs negative words in the title for a proxy sentiment
+            positive_words = ['gains', 'rise', 'strong', 'growth', 'up', 'outperform']
+            negative_words = ['drops', 'falls', 'weak', 'plunge', 'down', 'underperform']
+            
+            sentiment_scores = []
+            for article in articles:
+                title = article.get('title', '').lower()
+                pos_count = sum(1 for word in positive_words if word in title)
+                neg_count = sum(1 for word in negative_words if word in title)
+                
+                # Score is clamped between -1 and 1
+                if pos_count > neg_count:
+                    sentiment_scores.append(0.5)
+                elif neg_count > pos_count:
+                    sentiment_scores.append(-0.5)
+                else:
+                    sentiment_scores.append(0.0)
+            
+            print(f"News API: Analyzed {len(sentiment_scores)} article titles.")
+            return sentiment_scores
+        except Exception as e:
+            print(f"News API request failed: {e}")
+            return []
+
+    def fetch_realtime_sentiment(self) -> float:
+        """Combines sentiment from all available sources."""
+        all_sentiments = []
+        
+        # 1. MarketAux
+        all_sentiments.extend(self._get_marketaux_sentiment())
+        
+        # 2. New News API (Heuristic Score)
+        all_sentiments.extend(self._get_newsapi_sentiment())
+        
+        if not all_sentiments:
+            print("WARNING: Failed to fetch sentiment from both sources. Returning 0.0.")
             return 0.0
+
+        avg_sentiment = sum(all_sentiments) / len(all_sentiments)
+        print(f"Combined Sentiment Score: {avg_sentiment:.3f} (from {len(all_sentiments)} entities/articles)")
+        return avg_sentiment
+
 # --- 3. Trading Strategy and Signal Generation ---
 class Backtester:
     """
@@ -427,7 +465,7 @@ class SignalGenerator:
         print(f"\n--- Initializing Historical Data for {self.symbol} ---")
 
         if not self.data_feed.api_key:
-            print("ERROR: Alpha Vantage API Key is missing. Cannot fetch data.")
+            print("ERROR: Data Feed API Key is missing. Cannot fetch data.")
             self.data = pd.DataFrame()
             return
         self.data = self.data_feed.fetch_historical_data(self.symbol, self.interval, self.lookback_years)
@@ -562,15 +600,22 @@ class SignalGenerator:
 def run_signal_generation_logic():
     """Initializes and runs the signal generation, backtesting, and email process."""
 
-    if not ALPHA_VANTAGE_API_KEY:
-        print("FATAL: ALPHA_VANTAGE_API_KEY environment variable is not set. Exiting.")
-        return {"signal": "HOLD", "reason": "Missing Alpha Vantage API Key."}
-
+    if not TWELVESDATA_API_KEY:
+        print("FATAL: TWELVESDATA_API_KEY is not set. Cannot fetch data.")
+        return {"signal": "HOLD", "reason": "Missing primary data feed API Key."}
+    
     if not MARKETAUX_API_KEY:
-        print("WARNING: MARKETAUX_API_KEY environment variable is not set. Sentiment will be 0.0.")
+        print("WARNING: MARKETAUX_API_KEY is not set. Fundamental analysis will be limited.")
+
     try:
-        market_data_api = AlphaVantageDataFeed(api_key=ALPHA_VANTAGE_API_KEY)
-        sentiment_api = MarketAuxProcessor(api_key=MARKETAUX_API_KEY)
+        # Initialize Data Feed with Twelves Data
+        market_data_api = TwelvesDataFeed(api_key=TWELVESDATA_API_KEY)
+        
+        # Initialize Fundamental Processor with MarketAux and the new News API
+        sentiment_api = MultiSourceSentimentProcessor(
+            marketaux_key=MARKETAUX_API_KEY, 
+            news_api_key=NEW_NEWS_API_KEY
+        )
         generator = SignalGenerator(data_feed=market_data_api, fundamental_processor=sentiment_api)
         # 1. Initialize historical data (runs once)
         print("\n" + "="*50)
