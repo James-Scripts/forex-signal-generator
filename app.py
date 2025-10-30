@@ -648,15 +648,26 @@ def run_signal_generation_logic():
         print("\n" + "*"*50)
         print("### BACKTEST RESULTS (Using Fixed TP/SL) ###")
         
-        # --- FIX: Using .get() for safe printing of backtest results ---
+        # Using .get() for safe printing of backtest results
         print(f"Total Trades Analyzed: {backtest_results.get('total_trades', 0)}")
         print(f"Winning Trades: {backtest_results.get('winning_trades', 0)}")
         print(f"Net Pips Gained: **{backtest_results.get('net_pips', 0.0):.2f}**")
         print(f"Profit Factor: **{backtest_results.get('profit_factor', 0.0):.2f}**")
         print(f"Details: {backtest_results.get('reason', 'Unknown failure.')}")
-        # -----------------------------------------------------------
         
         print("*"*50)
+        
+        # -------------------------------------------------------------------------
+        # ⚠️ CRITICAL FIX: Rate Limit Delay
+        # Add a 60-second delay to ensure the real-time data fetch (Step 3) 
+        # occurs in a separate API minute window from the historical data fetch (Step 1).
+        print("\n" + "="*50)
+        print("### PAUSING FOR 60 SECONDS TO AVOID TWELVES DATA RATE LIMIT ###")
+        print(f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        time.sleep(60) # Pause the execution for 60 seconds
+        print(f"Resuming execution at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("="*50 + "\n")
+        # -------------------------------------------------------------------------
 
         # 3. Run the real-time signal generation
         print("\n" + "="*50)
