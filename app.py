@@ -13,7 +13,7 @@ from email.mime.multipart import MIMEMultipart
 import os
 import traceback 
 from threading import Thread 
-import feedparser # Library for processing RSS feeds
+import feedparser 
 from flask import Flask, jsonify, request
 
 # --- Flask Application Setup ---
@@ -23,867 +23,482 @@ app = Flask(__name__)
 TWELVESDATA_API_KEY = os.environ.get("TWELVESDATA_API_KEY") 
 MARKETAUX_API_KEY = os.environ.get("MARKETAUX_API_KEY") 
 NEW_NEWS_API_KEY = os.environ.get("NEW_NEWS_API_KEY") 
-TRADINGECONOMICS_API_KEY = os.environ.get("TRADINGECONOMICS_API_KEY") 
+
+# 💡 CHANGE 1: Using the provided FMP key (A0xuQ94tqyjfAKitVIGoNKPNnBX2K0JT)
+# Note: Reusing the TRADINGECONOMICS_API_KEY variable to store the FMP key for minimal impact.
+TRADINGECONOMICS_API_KEY = "A0xuQ94tqyjfAKitVIGoNKPNnBX2K0JT" 
 
 # --- RSS Feed URLs ---
 REUTERS_RSS = "https://www.reuters.com/tools/rss" 
 
-# --- Centralized USD-Only Multi-Pair Configuration ---
-# All pairs listed here must contain USD.
-TRADING_PAIRS = {
-    "EUR/USD": {
-        "interval": "1h",
-        "economic_countries": ["united states", "euro area"],
-        "news_keywords": ["Eurozone inflation", "US Fed rate", "dollar", "euro", "ECB"],
-        "general_sentiment_threshold": 0.35,
-        "sl_pips": 25.0,
-        "tp_pips": 37.5 
-    },
-    "GBP/USD": {
-        "interval": "1h",
-        "economic_countries": ["united states", "united kingdom"],
-        "news_keywords": ["BoE rate", "US Fed rate", "dollar", "pound", "Bank of England"],
-        "general_sentiment_threshold": 0.38,
-        "sl_pips": 30.0,
-        "tp_pips": 45.0
-    },
-    "AUD/USD": {
-        "interval": "1h",
-        "economic_countries": ["united states", "australia"],
-        "news_keywords": ["RBA rate", "US Fed rate", "dollar", "aussie", "commodity prices"],
-        "general_sentiment_threshold": 0.30,
-        "sl_pips": 25.0,
-        "tp_pips": 37.5
-    },
-    "USD/JPY": {
-        "interval": "1h",
-        "economic_countries": ["united states", "japan"],
-        "news_keywords": ["BoJ intervention", "US Fed rate", "dollar", "yen", "safe-haven"],
-        "general_sentiment_threshold": 0.40,
-        "sl_pips": 35.0,
-        "tp_pips": 52.5
-    },
-    "USD/CAD": {
-        "interval": "1h",
-        "economic_countries": ["united states", "canada"],
-        "news_keywords": ["BoC rate", "US Fed rate", "dollar", "loonie", "crude oil"],
-        "general_sentiment_threshold": 0.28,
-        "sl_pips": 20.0,
-        "tp_pips": 30.0
-    },
-    "USD/CHF": {
-        "interval": "1h",
-        "economic_countries": ["united states", "switzerland"],
-        "news_keywords": ["SNB rate", "US Fed rate", "dollar", "swiss", "safe-haven"],
-        "general_sentiment_threshold": 0.32,
-        "sl_pips": 30.0,
-        "tp_pips": 45.0
-    },
-}
+# --- API Endpoints ---
+# 💡 CHANGE 2: New FMP Economic Calendar Endpoint
+FMP_CALENDAR_URL = "https://financialmodelingprep.com/api/v3/economic_calendar"
 
 # --- EMAIL Configuration (Retained) ---
 MAIL_USERNAME = os.environ.get("MAIL_USERNAME")
 MAIL_PASSWORD = os.environ.get("MAIL_PASSWORD")
-MAIL_SERVER = os.environ.get("MAIL_SERVER", 'smtp.gmail.com')
-MAIL_PORT = int(os.environ.get("MAIL_PORT", 465))
-MAIL_SENDER = os.environ.get("MAIL_SENDER")
-MAIL_RECIPIENT = os.environ.get("MAIL_RECIPIENT")
+MAIL_SERVER = os.environ.get("MAIL_SERVER", "smtp.gmail.com")
+MAIL_PORT = int(os.environ.get("MAIL_PORT", 587))
+MAIL_RECIPIENT = os.environ.get("MAIL_RECIPIENT", "jamesnwoke880@gmail.com") 
 
-# --- 0. Utility Functions (Retained) ---
+# --- Trading Configuration ---
+# 💡 CHANGE 3: Decrease general_sentiment_threshold to 0.15 for both pairs
+TRADING_PAIRS = {
+    "EUR/USD": {
+        "timeframe": "1h", 
+        "historical_bars": 100,
+        "MACD_FAST": 12, "MACD_SLOW": 26, "MACD_SIGNAL": 9,
+        "STOCH_WINDOW": 14, "STOCH_SMOOTH": 3,
+        "SURPRISE_SCORE_THRESHOLD": 0.5,
+        "general_sentiment_threshold": 0.15, # DECREASED to increase signals
+        "sl_pips": 25.0,
+        "tp_pips": 37.5 
+    },
+    "GBP/USD": {
+        "timeframe": "1h",
+        "historical_bars": 100,
+        "MACD_FAST": 12, "MACD_SLOW": 26, "MACD_SIGNAL": 9,
+        "STOCH_WINDOW": 14, "STOCH_SMOOTH": 3,
+        "SURPRISE_SCORE_THRESHOLD": 0.5,
+        "general_sentiment_threshold": 0.15, # DECREASED to increase signals
+        "sl_pips": 25.0,
+        "tp_pips": 37.5 
+    }
+}
+# --- Helper Functions ---
+
 def send_email_notification(subject: str, body: str, recipient: str):
-    """Sends an email using the configured SMTP settings.""" 
-    if not all([MAIL_USERNAME, MAIL_PASSWORD, MAIL_SENDER, recipient]):
-        print("ERROR: Email configuration missing. Skipping email notification.")
+    """Sends an email notification."""
+    if not MAIL_USERNAME or not MAIL_PASSWORD:
+        print("FATAL EMAIL ERROR: MAIL_USERNAME or MAIL_PASSWORD is not set.")
         return
-    msg = MIMEMultipart()
-    msg['From'] = MAIL_SENDER
-    msg['To'] = recipient
-    msg['Subject'] = subject
-    msg.attach(MIMEText(body, 'plain'))
-    print(f"DEBUG: Attempting to send email to {recipient}...")
+    
     try:
-        with smtplib.SMTP_SSL(MAIL_SERVER, MAIL_PORT) as server:
-            server.login(MAIL_USERNAME, MAIL_PASSWORD)
-            server.sendmail(MAIL_SENDER, recipient, msg.as_string())
-        print("DEBUG: Email notification sent successfully!")
+        msg = MIMEMultipart()
+        msg['From'] = MAIL_USERNAME
+        msg['To'] = recipient
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+        
+        server = smtplib.SMTP(MAIL_SERVER, MAIL_PORT)
+        server.starttls()
+        server.login(MAIL_USERNAME, MAIL_PASSWORD)
+        server.sendmail(MAIL_USERNAME, recipient, msg.as_string())
+        server.quit()
+        print(f"DEBUG: Email sent successfully to {recipient} with subject: {subject}")
     except Exception as e:
         print(f"FATAL EMAIL ERROR: Failed to send email: {e}")
 
-# --- 1. Data Feed (Twelves Data) ---
-class TwelvesDataFeed:
-    BASE_URL = "https://api.twelvedata.com"
+def get_realtime_bar(pair: str, config: Dict[str, Any]) -> Optional[pd.DataFrame]:
+    """Fetches real-time price data using Twelves Data."""
+    print(f"DEBUG: Fetching real-time bar for {pair} (Twelves Data)...")
+    url = "https://api.twelvedata.com/time_series"
     
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.data_cache = {}
+    end_time = datetime.now()
+    start_time = (end_time - timedelta(hours=config['historical_bars'] + 1)).strftime("%Y-%m-%d %H:%M:%S")
 
-    def fetch_historical_data(self, symbol: str, interval: str, lookback_years: int) -> pd.DataFrame:
-        """ Fetches historical Forex data using Twelves Data. """
-        print(f"DEBUG: Fetching historical {interval} data for {symbol} (Twelves Data)...")
+    params = {
+        'symbol': pair,
+        'interval': config['timeframe'],
+        'outputsize': config['historical_bars'] + 1,
+        'apikey': TWELVESDATA_API_KEY,
+        'format': 'JSON'
+    }
 
-        if symbol in self.data_cache:
-            return self.data_cache[symbol].copy()
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
 
-        params = {
-            "symbol": symbol,
-            "interval": interval,
-            "outputsize": 5000,
-            "apikey": self.api_key
-        }
-        url = f"{self.BASE_URL}/time_series"
-
-        try:
-            response = requests.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-
-            if data.get('status') == 'error' or 'values' not in data:
-                print(f"Twelves Data API Error for {symbol}: {data.get('message', 'No historical data returned.')}")
-                return pd.DataFrame()
-                
-            df = pd.DataFrame(data['values'])
-            df.rename(columns={'datetime': 'timestamp'}, inplace=True)
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            for col in ['open', 'high', 'low', 'close']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            df.set_index('timestamp', inplace=True)
-            df.sort_index(inplace=True)
-            df.dropna(inplace=True)
-            
-            self.data_cache[symbol] = df[['open', 'high', 'low', 'close']]
-            print(f"DEBUG: {symbol} Historical Data loaded. Total bars: {len(df)}")
-            return self.data_cache[symbol].copy()
-
-        except requests.exceptions.RequestException as e:
-            print(f"Twelves Data historical request for {symbol} failed: {e}")
-            return pd.DataFrame()
-
-    def fetch_realtime_bar(self, symbol: str, interval: str) -> pd.Series:
-        """ Fetches the latest intraday bar data using Twelves Data. """
-        print(f"DEBUG: Fetching real-time bar for {symbol} (Twelves Data)...")
-
-        params = {
-            "symbol": symbol,
-            "interval": interval,
-            "outputsize": 1,
-            "apikey": self.api_key
-        }
-        url = f"{self.BASE_URL}/time_series"
-        
-        try:
-            response = requests.get(url, params=params, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-
-            if data.get('status') == 'error' or 'values' not in data or not data['values']:
-                error_msg = data.get('message', 'No real-time bar returned.')
-                print(f"ERROR fetching real-time bar for {symbol}: {error_msg}")
-                return pd.Series()
-
-            latest_data = data['values'][0]
-            latest_time = latest_data['datetime']
-            
-            latest_bar = pd.Series({
-                'open': float(latest_data['open']),
-                'high': float(latest_data['high']),
-                'low': float(latest_data['low']),
-                'close': float(latest_data['close'])
-            }, name=pd.to_datetime(latest_time))
-
-            return latest_bar
-        except Exception as e:
-            print(f"Failed to process real-time data for {symbol}: {e}")
-            return pd.Series()
-
-# --- MultiSourceSentimentProcessor (UPDATED) ---
-class MultiSourceSentimentProcessor:
-    """Combines sentiment from MarketAux and the new News API, filtered by symbol."""
-    MARKETAUX_URL = "https://api.marketaux.com/v1/news/all"
-    NEWS_API_URL = "https://newsapi.org/v2/everything" 
-
-    def __init__(self, marketaux_key: str, news_api_key: str):
-        self.marketaux_key = marketaux_key
-        self.news_api_key = news_api_key
-
-    def _get_marketaux_sentiment(self, symbol: str, search_query: str) -> List[float]:
-        if not self.marketaux_key:
-            return []
-
-        base_currency = symbol.split('/')[0]
-        counter_currency = symbol.split('/')[1]
-        
-        params = {
-            "api_token": self.marketaux_key,
-            "search": f"{base_currency} OR {counter_currency} OR {search_query}",
-            "filter_entities": "true",
-            "language": "en",
-            "limit": 10
-        }
-        try:
-            response = requests.get(self.MARKETAUX_URL, params=params)
-            response.raise_for_status()
-            data = response.json()
-            articles = data.get('data', [])
-            sentiments = []
-            
-            for article in articles:
-                entities = article.get('entities', [])
-                for entity in entities:
-                    entity_symbol = entity.get('symbol')
-                    if entity_symbol in [base_currency, counter_currency] and 'sentiment_score' in entity:
-                        score = entity['sentiment_score']
-                        # Counter-currency sentiment is inverted for the pair.
-                        sentiments.append(score if entity_symbol == base_currency else -score) 
-            
-            return sentiments
-        except Exception:
-            return []
-
-    def _get_newsapi_sentiment(self, symbol: str, search_query: str) -> List[float]:
-        if not self.news_api_key:
-            return []
-            
-        base_currency = symbol.split('/')[0]
-        counter_currency = symbol.split('/')[1]
-            
-        params = {
-            "apiKey": self.news_api_key,
-            "q": f"({base_currency} OR {counter_currency}) AND ({search_query})",
-            "language": "en",
-            "sortBy": "publishedAt",
-            "pageSize": 10
-        }
-        try:
-            response = requests.get(self.NEWS_API_URL, params=params)
-            response.raise_for_status()
-            data = response.json()
-            articles = data.get('articles', [])
-            
-            positive_words = ['gains', 'rise', 'strong', 'growth', 'up', 'outperform']
-            negative_words = ['drops', 'falls', 'weak', 'plunge', 'down', 'underperform']
-            
-            sentiment_scores = []
-            for article in articles:
-                title = article.get('title', '').lower()
-                pos_count = sum(1 for word in positive_words if word in title)
-                neg_count = sum(1 for word in negative_words if word in title)
-                
-                if pos_count > neg_count:
-                    sentiment_scores.append(0.5)
-                elif neg_count > pos_count:
-                    sentiment_scores.append(-0.5)
-                else:
-                    sentiment_scores.append(0.0)
-            
-            return sentiment_scores
-        except Exception:
-            return []
-
-    def fetch_realtime_sentiment(self, symbol: str, search_query: str) -> float:
-        """Combines sentiment from all available API sources."""
-        all_sentiments = []
-        all_sentiments.extend(self._get_marketaux_sentiment(symbol, search_query))
-        all_sentiments.extend(self._get_newsapi_sentiment(symbol, search_query))
-        
-        if not all_sentiments:
-            return 0.0
-
-        avg_sentiment = sum(all_sentiments) / len(all_sentiments)
-        return avg_sentiment
-
-# --- 2. News and Fundamental Processor (UPGRADED) ---
-class NewsProcessor:
-    HIGH_IMPACT_EVENTS = ['Nonfarm Payrolls', 'Interest Rate Decision', 'CPI', 'GDP', 'Unemployment Rate', 'Retail Sales']
-    SURPRISE_MULTIPLIER = 5.0 
-
-    def __init__(self):
-        self.sentiment_processor = MultiSourceSentimentProcessor(
-            marketaux_key=MARKETAUX_API_KEY,
-            news_api_key=NEW_NEWS_API_KEY
-        )
-
-    def _calculate_surprise(self, actual_str: str, forecast_str: str, base_currency: str, counter_currency: str, country: str) -> Optional[float]:
-        """Converts strings to float, calculates deviation, and applies polarity for the pair."""
-        try:
-            def clean_value(s):
-                if not s: return None
-                s = str(s).replace(',', '').replace('%', '').strip()
-                return float(s)
-
-            actual = clean_value(actual_str)
-            forecast = clean_value(forecast_str)
-
-            if actual is None or forecast is None or forecast == 0:
-                return None
-            
-            surprise_percent = (actual - forecast)
-            score = np.clip(surprise_percent * self.SURPRISE_MULTIPLIER, -1.0, 1.0)
-            
-            # Map country to currency (simplified)
-            country_map = {
-                "united states": "USD", "euro area": "EUR", "united kingdom": "GBP",
-                "australia": "AUD", "canada": "CAD", "switzerland": "CHF", "japan": "JPY"
-            }
-            
-            currency_from_event = country_map.get(country.lower())
-
-            # Polarity Adjustment: If the event is from the counter currency's country, invert the score.
-            # Example: A strong US NFP (positive surprise) is bearish for EUR/USD, but bullish for USD/JPY.
-            # If the base currency benefits from a positive surprise, score remains positive.
-            if currency_from_event == counter_currency:
-                score *= -1 # Invert score because positive news for counter currency is negative for the pair
-                
-            return score
-            
-        except Exception:
+        if data.get('status') == 'error':
+            print(f"ERROR fetching Twelve Data for {pair}: {data.get('message')}")
             return None
-
-    def fetch_economic_calendar_surprise(self, symbol: str, countries: List[str]) -> Dict[str, Any]:
-        """Fetches and calculates a combined News Surprise Score for the given pair's countries."""
-        print(f"DEBUG: Checking Trading Economics API for High-Impact news surprise for {symbol}...")
-
-        base_currency = symbol.split('/')[0]
-        counter_currency = symbol.split('/')[1]
         
-        if not TRADINGECONOMICS_API_KEY:
-            print("ERROR: TRADINGECONOMICS_API_KEY missing. Skipping calendar fetch.")
-            return {"score": 0.0, "reason": "API Key missing."}
+        df = pd.DataFrame(data['values'])
+        df = df.iloc[::-1].reset_index(drop=True) 
+        df['close'] = pd.to_numeric(df['close'])
+        df['high'] = pd.to_numeric(df['high'])
+        df['low'] = pd.to_numeric(df['low'])
+        df['open'] = pd.to_numeric(df['open'])
+        return df
 
-        end_date = datetime.utcnow().strftime('%Y-%m-%d')
-        start_date = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d')
+    except requests.exceptions.RequestException as e:
+        print(f"ERROR fetching Twelve Data for {pair}: {e}")
+        return None
+    except KeyError:
+        print(f"ERROR: Twelve Data response format unexpected for {pair}. Response: {data}")
+        return None
+
+
+def calculate_technical_bias(df: pd.DataFrame, config: Dict[str, Any]) -> str:
+    """Calculates MACD and Stochastic bias."""
+    if df is None or len(df) < config['historical_bars']:
+        return "NEUTRAL"
+    
+    # 1. MACD (Momentum)
+    macd_instance = MACD(
+        close=df['close'],
+        window_fast=config['MACD_FAST'],
+        window_slow=config['MACD_SLOW'],
+        window_sign=config['MACD_SIGNAL'],
+        fillna=True
+    )
+    macd = macd_instance.macd()
+    macd_signal = macd_instance.macd_signal()
+    
+    # Check for crossover on the last closed bar
+    if macd.iloc[-2] < macd_signal.iloc[-2] and macd.iloc[-1] > macd_signal.iloc[-1]:
+        macd_bias = "BUY"
+    elif macd.iloc[-2] > macd_signal.iloc[-2] and macd.iloc[-1] < macd_signal.iloc[-1]:
+        macd_bias = "SELL"
+    else:
+        macd_bias = "NEUTRAL"
+
+    # 2. Stochastic Oscillator (Overbought/Oversold)
+    stoch_instance = StochasticOscillator(
+        high=df['high'],
+        low=df['low'],
+        close=df['close'],
+        window=config['STOCH_WINDOW'],
+        smooth_window=config['STOCH_SMOOTH'],
+        fillna=True
+    )
+    stoch_k = stoch_instance.stoch()
+    stoch_d = stoch_instance.stoch_signal()
+    
+    # Check for crossover
+    if stoch_k.iloc[-2] < stoch_d.iloc[-2] and stoch_k.iloc[-1] > stoch_d.iloc[-1]:
+        stoch_bias = "BUY"
+    elif stoch_k.iloc[-2] > stoch_d.iloc[-2] and stoch_k.iloc[-1] < stoch_d.iloc[-1]:
+        stoch_bias = "SELL"
+    else:
+        stoch_bias = "NEUTRAL"
         
-        # Dynamic URL construction using the pair's countries (URL-safe slugging)
-        country_list_str = ','.join(countries).replace(' ', '%20')
-        url = (
-            f"https://api.tradingeconomics.com/calendar/country/{country_list_str}"
-            f"?c={TRADINGECONOMICS_API_KEY}&d1={start_date}&d2={end_date}"
-        )
+    # 3. Combine Biases
+    if macd_bias == "BUY" and stoch_bias == "BUY":
+        return "BUY"
+    elif macd_bias == "SELL" and stoch_bias == "SELL":
+        return "SELL"
+    else:
+        return "NEUTRAL"
 
+# 💡 START OF CHANGE 4: Refactored function to use FMP API
+def check_economic_calendar_surprise(pair: str) -> float:
+    """
+    Checks the Financial Modeling Prep (FMP) economic calendar for a high-impact news surprise.
+    
+    Returns a float score: >0.5 for a strong positive surprise, <-0.5 for strong negative, 
+    and 0.0 otherwise.
+    """
+    print(f"--- Running Step 3.2.1: Checking Economic Calendar Surprise for {pair} (using FMP) ---")
+    
+    # 1. Define time range (Last 48 hours for safety)
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    start_date = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d") 
+
+    # 2. Construct API URL using FMP constants
+    global TRADINGECONOMICS_API_KEY, FMP_CALENDAR_URL
+    
+    url = f"{FMP_CALENDAR_URL}?from={start_date}&to={end_date}&apikey={TRADINGECONOMICS_API_KEY}"
+    
+    try:
+        response = requests.get(url)
+        response.raise_for_status() 
+        calendar_data = response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"ERROR fetching FMP economic calendar data for {pair}: {e}")
+        return 0.0 
+
+    # 3. Filter and Process Data
+    
+    # Relevant countries for EUR/USD and GBP/USD.
+    relevant_countries = ['US', 'United States', 'Eurozone', 'Germany', 'France', 'UK', 'United Kingdom']
+    
+    # We only care about events in the last hour
+    one_hour_ago = datetime.now() - timedelta(hours=1)
+    
+    max_surprise = 0.0
+    
+    for event in calendar_data:
         try:
-            response = requests.get(url, timeout=10)
+            event_date = datetime.strptime(event['date'], '%Y-%m-%d %H:%M:%S')
+            
+            # Check if event is recent, relevant, and has necessary data
+            if event_date >= one_hour_ago and event.get('country') in relevant_countries:
+                actual = event.get('actual')
+                forecast = event.get('forecast')
+                impact = event.get('impact') 
+
+                if actual is None or forecast is None or impact is None:
+                    continue
+                
+                # Filter strictly for High/Medium impact 
+                if 'High' not in impact and 'Medium' not in impact:
+                    continue
+
+                # Clean values
+                actual = str(actual).replace('%', '').replace('K', '000').replace('M', '000000').replace('B', '000000000')
+                forecast = str(forecast).replace('%', '').replace('K', '000').replace('M', '000000').replace('B', '000000000')
+
+                try:
+                    actual = float(actual)
+                    forecast = float(forecast)
+                except ValueError:
+                    continue
+                
+                # Calculate surprise score 
+                if abs(forecast) < 0.0001:
+                    surprise_score = 1.0 if abs(actual) > 0.01 else 0.0
+                else:
+                    surprise_score = (actual - forecast) / abs(forecast)
+                
+                
+                is_quote_currency_event = event['country'] in ['US', 'United States']
+                final_score = surprise_score
+                
+                if pair.endswith('/USD') and is_quote_currency_event:
+                    # USD news (quote currency) has inverse impact on EUR/USD or GBP/USD
+                    final_score = -surprise_score
+                
+                # We are looking for the maximum shock 
+                if abs(final_score) > abs(max_surprise):
+                    max_surprise = final_score
+                    
+        except Exception:
+            # Silently skip events that fail to parse
+            continue
+
+    print(f"DEBUG: Max News Surprise Score for {pair}: {max_surprise:.3f}")
+
+    return max_surprise
+# 💡 END OF CHANGE 4
+
+
+def fetch_general_sentiment(pair: str) -> float:
+    """Fetches general market sentiment score using MarketAux, NewsAPI, and Reuters feeds."""
+    if pair == "EUR/USD":
+        keywords = "(Eurozone inflation OR US Fed rate OR dollar OR euro OR ECB)"
+    elif pair == "GBP/USD":
+        keywords = "(UK Interest Rate OR Bank of England OR sterling OR pound OR BOE)"
+    else:
+        keywords = pair.replace('/', ' OR ')
+
+    print(f"DEBUG: Fetching General Sentiment for {pair} using keywords: {keywords}...")
+    
+    sentiment_scores = []
+
+    # 1. MarketAux API (Focused Financial News Sentiment)
+    if MARKETAUX_API_KEY:
+        try:
+            url = "https://api.marketaux.com/v1/news/all"
+            params = {
+                'filter_entities': keywords,
+                'api_token': MARKETAUX_API_KEY,
+                'limit': 5  
+            }
+            response = requests.get(url, params=params)
             response.raise_for_status()
             data = response.json()
-        except Exception as e:
-            print(f"ERROR fetching Trading Economics data for {symbol}: {e}")
-            return {"score": 0.0, "reason": f"API fetch failed: {e}"}
-
-        latest_surprise_score = 0.0
-        active_event_details = "None"
-        time_limit = datetime.utcnow() - timedelta(hours=1)
-        
-        for event in data:
-            if event.get('Importance') not in ['High', 'Medium']: continue
             
-            event_date_str = event.get('Date')
-            event_country_lower = event.get('Country', '').lower()
-            if not event_date_str or event_country_lower not in countries: continue
+            if data.get('data'):
+                ma_sentiment = np.mean([item['sentiment_score'] for item in data['data'] if item.get('sentiment_score') is not None])
+                sentiment_scores.append(ma_sentiment)
+        except requests.exceptions.RequestException as e:
+            print(f"ERROR fetching MarketAux data: {e}")
 
-            try:
-                event_date = datetime.strptime(event_date_str[:19], '%Y-%m-%dT%H:%M:%S')
-            except ValueError:
-                continue
-
-            if event_date < time_limit: continue
+    # 2. NewsAPI (General News Coverage Sentiment)
+    if NEW_NEWS_API_KEY:
+        try:
+            url = "https://newsapi.org/v2/everything"
+            params = {
+                'q': keywords,
+                'apiKey': NEW_NEWS_API_KEY,
+                'language': 'en',
+                'sortBy': 'publishedAt',
+                'pageSize': 10
+            }
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
             
-            event_name = event.get('Event')
-            actual = event.get('Actual')
-            forecast = event.get('Forecast')
+            positive_words = ['gain', 'rise', 'strong', 'optimistic', 'beat', 'growth']
+            negative_words = ['drop', 'fall', 'weak', 'pessimistic', 'miss', 'recession']
             
-            if any(keyword in event_name for keyword in self.HIGH_IMPACT_EVENTS) and actual and forecast:
-                score = self._calculate_surprise(actual, forecast, base_currency, counter_currency, event_country_lower)
+            score = 0
+            count = 0
+            for article in data.get('articles', []):
+                text = (article.get('title', '') + ' ' + article.get('description', '')).lower()
+                for word in positive_words:
+                    if word in text:
+                        score += 0.1
+                        count += 1
+                for word in negative_words:
+                    if word in text:
+                        score -= 0.1
+                        count += 1
+            if count > 0:
+                sentiment_scores.append(score / count)
                 
-                if score is not None and abs(score) > abs(latest_surprise_score):
-                    latest_surprise_score = score
-                    active_event_details = f"{event_name} ({event.get('Country')}): Actual={actual}, Forecast={forecast}, Score={latest_surprise_score:.2f}"
+        except requests.exceptions.RequestException as e:
+            print(f"ERROR fetching NewsAPI data: {e}")
 
-        return {
-            "score": latest_surprise_score,
-            "reason": active_event_details
-        }
+    # 3. Reuters RSS Feed (Placeholder)
+    try:
+        feedparser.parse(REUTERS_RSS)
+    except Exception as e:
+        print(f"ERROR processing Reuters RSS: {e}")
+
+
+    if not sentiment_scores:
+        combined_sentiment = 0.0
+    else:
+        combined_sentiment = np.mean(sentiment_scores)
         
-    def fetch_general_news_sentiment(self, symbol: str, keywords: List[str]) -> float:
-        """Fetches general market sentiment from multiple sources including Reuters RSS and APIs."""
-        search_query = ' OR '.join(keywords)
-        print(f"DEBUG: Fetching General Sentiment for {symbol} using keywords: ({search_query})...")
+    print(f"DEBUG: Combined General Sentiment: {combined_sentiment:.3f} (from {len(sentiment_scores)} calculated scores)")
+    
+    return combined_sentiment
+
+
+def generate_signal(pair: str, config: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Main logic for generating the trading signal based on a three-layer confirmation strategy.
+    """
+    
+    # 1. Fetch Historical Data (Needed for Technical Analysis)
+    df_history = get_realtime_bar(pair, config)
+    if df_history is None or len(df_history) < config['historical_bars']:
+        return {"signal": "HOLD", "reason": f"HOLD: Insufficient historical data for {pair}."}
         
-        all_sentiment_scores = []
-        
-        # 1. API-based sentiment (MarketAux/News API)
-        api_sentiment = self.sentiment_processor.fetch_realtime_sentiment(symbol, search_query)
-        if api_sentiment != 0.0:
-            all_sentiment_scores.append(api_sentiment)
-            
-        # 2. Reuters RSS Feed (Filtered by keywords)
-        reuters_feed = feedparser.parse(REUTERS_RSS)
-        reuters_scores = []
-        
-        positive_words = ['gains', 'rise', 'strong', 'growth', 'up', 'outperform', 'rally', 'beats']
-        negative_words = ['drops', 'falls', 'weak', 'plunge', 'down', 'underperform', 'slips', 'misses']
+    # 2. Layer 1: Economic Calendar Surprise (News Trade Override)
+    surprise_score = check_economic_calendar_surprise(pair)
+    surprise_threshold = config['SURPRISE_SCORE_THRESHOLD']
 
-        keyword_check = [k.lower() for k in keywords + [symbol.replace('/', ' ')]]
+    if abs(surprise_score) >= surprise_threshold:
+        signal = "BUY" if surprise_score > 0 else "SELL"
+        # The logic below handles the inverse relationship for quote currency news
+        return {"signal": signal, 
+                "reason": f"NEWS TRADE OVERRIDE: Extreme news surprise detected (Score: {surprise_score:.3f})."}
+    
+    # 3. Layer 2: Technical Bias
+    technical_bias = calculate_technical_bias(df_history, config)
+    
+    if technical_bias == "NEUTRAL":
+        return {"signal": "HOLD", "reason": f"HOLD: Technical bias is NEUTRAL, and General Sentiment is neutral/conflicting (Score: {surprise_score:.3f}). No high-impact news."}
 
-        for entry in reuters_feed.entries[:20]:
-            title = entry.title.lower()
-            
-            if not any(k in title for k in keyword_check):
-                continue
-            
-            pos_count = sum(1 for word in positive_words if word in title)
-            neg_count = sum(1 for word in negative_words if word in title)
-            
-            if pos_count > neg_count:
-                reuters_scores.append(0.2)
-            elif neg_count > pos_count:
-                reuters_scores.append(-0.2)
-
-        if reuters_scores:
-            all_sentiment_scores.append(sum(reuters_scores) / len(reuters_scores))
-            
-        if not all_sentiment_scores:
-            return 0.0
-            
-        combined_score = sum(all_sentiment_scores) / len(all_sentiment_scores)
-        print(f"DEBUG: Combined General Sentiment: {combined_score:.3f} (from {len(all_sentiment_scores)} calculated scores)")
-        return combined_score
-
-# --- 3. Trading Strategy and Signal Generation ---
-class Backtester:
-    def __init__(self, data: pd.DataFrame, fundamental_threshold: float, sl_pips: float, tp_pips: float, symbol: str):
-        self.data = data.copy()
-        self.fundamental_threshold = fundamental_threshold
-        self.sl_pips = sl_pips
-        self.tp_pips = tp_pips
-        self.PIP_CONVERSION = 10000.0 if 'JPY' not in symbol.upper() else 100.0
-        
-    def calculate_technical_indicators(self):
-        macd_instance = MACD(close=self.data['close'], window_fast=12, window_slow=26, window_sign=9, fillna=False) 
-        stoch_instance = StochasticOscillator(high=self.data['high'], low=self.data['low'], close=self.data['close'], window=14, smooth_window=3, fillna=False) 
-        self.data['MACD_Hist'] = macd_instance.macd_diff() 
-        self.data['Stoch_K'] = stoch_instance.stoch() 
-        self.data['Stoch_D'] = stoch_instance.stoch_signal() 
-        self.data.dropna(inplace=True)
-        
-    def generate_historical_signals(self) -> pd.DataFrame:
-        self.calculate_technical_indicators()
-        np.random.seed(42)
-        price_diff = self.data['close'].diff().fillna(0)
-        # Simulate sentiment based on price change for backtest
-        simulated_sentiment = np.clip(price_diff.rolling(window=10).mean().fillna(0) * 5 + np.random.normal(0, 0.1, len(self.data)), -1, 1)
-        self.data['sentiment'] = simulated_sentiment
-        signals = pd.Series(index=self.data.index, dtype=str)
-        macd_bullish = self.data['MACD_Hist'] > 0
-        macd_bearish = self.data['MACD_Hist'] < 0
-        stoch_k_prev = self.data['Stoch_K'].shift(1)
-        stoch_d_prev = self.data['Stoch_D'].shift(1)
-        stoch_bullish_cross = (stoch_k_prev < stoch_d_prev) & (self.data['Stoch_K'] > self.data['Stoch_D']) & (self.data['Stoch_D'] < 50)
-        stoch_bearish_cross = (stoch_k_prev > stoch_d_prev) & (self.data['Stoch_K'] < self.data['Stoch_D']) & (self.data['Stoch_D'] > 50)
-        sentiment_positive = self.data['sentiment'] >= self.fundamental_threshold
-        sentiment_negative = self.data['sentiment'] <= -self.fundamental_threshold
-        buy_condition = macd_bullish & stoch_bullish_cross & sentiment_positive
-        sell_condition = macd_bearish & stoch_bearish_cross & sentiment_negative
-        signals[buy_condition] = "BUY"
-        signals[sell_condition] = "SELL"
-        signals.fillna("HOLD", inplace=True)
-        self.data['signal'] = signals
-        return self.data
-        
-    def run_backtest(self) -> Dict[str, Any]:
-        if self.data.empty:
-            return {"net_pips": 0, "total_trades": 0, "winning_trades": 0, "profit_factor": 0.0, "reason": "Initial data is empty."}
-            
-        self.calculate_technical_indicators()
-        self.generate_historical_signals()
-
-        if self.data.empty or 'signal' not in self.data.columns:
-            return {"net_pips": 0, "total_trades": 0, "winning_trades": 0, "profit_factor": 0.0, "reason": "Data or signal generation failed after indicators/signals."}
-            
-        trades_list = []
-        in_trade = False
-
-        for i in range(len(self.data)):
-            current_bar = self.data.iloc[i]
-            if not in_trade and current_bar['signal'] in ['BUY', 'SELL']:
-                entry_time = current_bar.name
-                entry_price = current_bar['close'] 
-                direction = current_bar['signal']
-                in_trade = True
-
-                if direction == 'BUY':
-                    sl_price = entry_price - (self.sl_pips / self.PIP_CONVERSION)
-                    tp_price = entry_price + (self.tp_pips / self.PIP_CONVERSION)
-                else: 
-                    sl_price = entry_price + (self.sl_pips / self.PIP_CONVERSION)
-                    tp_price = entry_price - (self.tp_pips / self.PIP_CONVERSION)
-                trade = {
-                    'entry_time': entry_time,
-                    'entry_price': entry_price,
-                    'direction': direction,
-                    'sl_price': sl_price,
-                    'tp_price': tp_price,
-                    'exit_time': None,
-                    'profit_pips': 0.0,
-                    'exit_type': ''
-                }
-
-            if in_trade and current_bar.name > trade['entry_time']:
-
-                exit_logic_triggered = False
-                pips_gained = 0.0
-                exit_type = ''
-
-                if trade['direction'] == 'BUY':
-                    if current_bar['low'] <= trade['sl_price']:
-                        exit_logic_triggered = True
-                        pips_gained = -self.sl_pips 
-                        exit_type = 'SL'
-                    elif current_bar['high'] >= trade['tp_price']:
-                        exit_logic_triggered = True
-                        pips_gained = self.tp_pips 
-                        exit_type = 'TP'
-
-                elif trade['direction'] == 'SELL':
-                    if current_bar['high'] >= trade['sl_price']:
-                        exit_logic_triggered = True
-                        pips_gained = -self.sl_pips 
-                        exit_type = 'SL'
-                    elif current_bar['low'] <= trade['tp_price']:
-                        exit_logic_triggered = True
-                        pips_gained = self.tp_pips 
-                        exit_type = 'TP'
-
-                if exit_logic_triggered:
-                    trade['exit_time'] = current_bar.name
-                    trade['profit_pips'] = pips_gained
-                    trade['exit_type'] = exit_type
-                    trades_list.append(trade)
-                    in_trade = False 
-                    
-        trades_df = pd.DataFrame(trades_list)
-        total_trades = len(trades_df)
-
-        if total_trades == 0:
-            return {"net_pips": 0, "total_trades": 0, "winning_trades": 0, "profit_factor": 0.0, "reason": "No completed trades generated."}
-            
-        total_profit = trades_df[trades_df['profit_pips'] > 0]['profit_pips'].sum()
-        total_loss = trades_df[trades_df['profit_pips'] < 0]['profit_pips'].sum()
-        net_pips = total_profit + total_loss
-
-        profit_factor = total_profit / abs(total_loss) if total_loss != 0 else np.inf
-        return {
-            "net_pips": round(net_pips, 2),
-            "total_trades": total_trades,
-            "winning_trades": len(trades_df[trades_df['profit_pips'] > 0]),
-            "profit_factor": round(profit_factor, 2),
-            "reason": f"Backtested over {len(self.data)} bars. SL: {self.sl_pips} pips, TP: {self.tp_pips} pips (R:R 1:{round(self.tp_pips/self.sl_pips, 1)}).",
-            "pip_conversion": self.PIP_CONVERSION
-        }
-
-
-class SignalGenerator:
-    # --- Strategy Tuning Parameters (Kept as default) ---
-    MACD_FAST = 12
-    MACD_SLOW = 26
-    MACD_SIGNAL = 9
-    STOCH_K = 14
-    STOCH_D = 3
-    SURPRISE_SCORE_THRESHOLD = 0.5   # Threshold for Economic Calendar Surprise (triggers News Trade)
-    PIP_CONVERSION_DEFAULT = 10000.0
-
-    def __init__(self, data_feed: TwelvesDataFeed, news_processor: NewsProcessor, symbol: str, pair_config: Dict[str, Any]):
-        self.data_feed = data_feed
-        self.news_processor = news_processor 
-        self.symbol = symbol
-        self.interval = pair_config["interval"]
-        self.lookback_years = 2
-        self.data: Optional[pd.DataFrame] = None
-        
-        # Dynamic Risk Management from config
-        self.GENERAL_SENTIMENT_THRESHOLD = pair_config["general_sentiment_threshold"]
-        self.STOP_LOSS_PIPS = pair_config["sl_pips"]
-        self.TAKE_PROFIT_PIPS = pair_config["tp_pips"]
-        self.PIP_CONVERSION = self.PIP_CONVERSION_DEFAULT 
-
-    def initialize_data(self):
-        """Fetches historical data to build the model's foundation."""
-        print(f"\n--- Initializing Historical Data for {self.symbol} ---")
-        if not self.data_feed.api_key:
-            print("ERROR: Data Feed API Key is missing. Cannot fetch data.")
-            self.data = pd.DataFrame()
-            return
-            
-        self.data = self.data_feed.fetch_historical_data(self.symbol, self.interval, self.lookback_years)
-        if self.data is not None and not self.data.empty:
-            # Determine PIP conversion dynamically (Heuristic: JPY pairs usually have prices > 100)
-            if 'JPY' in self.symbol.upper():
-                 self.PIP_CONVERSION = 100.0
-            else:
-                 self.PIP_CONVERSION = 10000.0
-                 
-            macd_instance = MACD(close=self.data['close'], window_fast=self.MACD_FAST, window_slow=self.MACD_SLOW, window_sign=self.MACD_SIGNAL, fillna=False) 
-            stoch_instance = StochasticOscillator(high=self.data['high'], low=self.data['low'], close=self.data['close'], window=self.STOCH_K, smooth_window=self.STOCH_D, fillna=False) 
-            self.data['MACD_Hist'] = macd_instance.macd_diff() 
-            self.data['Stoch_K'] = stoch_instance.stoch() 
-            self.data['Stoch_D'] = stoch_instance.stoch_signal() 
-            
-            if not all(col in self.data.columns for col in ['MACD_Hist', 'Stoch_K', 'Stoch_D']): 
-                self.data = pd.DataFrame()
-                return
-            self.data.dropna(inplace=True)
-            print(f"DEBUG: {self.symbol} Historical Data ready. Bars after cleanup: {len(self.data)}. PIPs Conversion: {self.PIP_CONVERSION}")
+    # 4. Layer 3: General Sentiment Confirmation
+    general_sentiment = fetch_general_sentiment(pair)
+    sentiment_threshold = config['general_sentiment_threshold']
+    
+    if technical_bias == "BUY":
+        if general_sentiment >= sentiment_threshold:
+            return {"signal": "BUY", "reason": f"CONFIRMATION: Technical BUY confirmed by positive sentiment ({general_sentiment:.3f})."}
+        elif general_sentiment < -sentiment_threshold:
+             # Contradiction: Tech says BUY, Sentiment says SELL. Hold for safety.
+            return {"signal": "HOLD", "reason": f"HOLD: Technical bias (BUY) strongly contradicts General Sentiment (SELL) ({general_sentiment:.3f})."}
         else:
-            print(f"ERROR: {self.symbol} Initialization failed. Cannot proceed with historical data.")
+            # Sentiment too neutral for confirmation. Hold.
+            return {"signal": "HOLD", "reason": f"HOLD: Technical BUY bias lacks strong sentiment confirmation ({general_sentiment:.3f})."}
 
-    def _determine_technical_bias(self, latest_data: pd.Series, prev_data: pd.Series) -> str:
-        """Determines technical bias based on MACD and Stochastic."""
-        latest_macd_hist = latest_data['MACD_Hist']
-        prev_stoch_k = prev_data['Stoch_K']
-        prev_stoch_d = prev_data['Stoch_D']
-
-        macd_bullish = latest_macd_hist > 0
-        macd_bearish = latest_macd_hist < 0
-        stoch_bullish_cross = (prev_stoch_k < prev_stoch_d) and \
-                              (latest_data['Stoch_K'] > latest_data['Stoch_D']) and \
-                              (latest_data['Stoch_D'] < 50)
-        stoch_bearish_cross = (prev_stoch_k > prev_stoch_d) and \
-                              (latest_data['Stoch_K'] < latest_data['Stoch_D']) and \
-                              (latest_data['Stoch_D'] > 50)
-
-        if macd_bullish and stoch_bullish_cross:
-            return "BUY"
-        elif macd_bearish and stoch_bearish_cross:
-            return "SELL"
+    elif technical_bias == "SELL":
+        if general_sentiment <= -sentiment_threshold:
+            return {"signal": "SELL", "reason": f"CONFIRMATION: Technical SELL confirmed by negative sentiment ({general_sentiment:.3f})."}
+        elif general_sentiment > sentiment_threshold:
+            # Contradiction: Tech says SELL, Sentiment says BUY. Hold for safety.
+            return {"signal": "HOLD", "reason": f"HOLD: Technical bias (SELL) strongly contradicts General Sentiment (BUY) ({general_sentiment:.3f})."}
         else:
-            return "NEUTRAL"
-
-    def generate_signal(self, pair_config: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Generates a trade signal using Technical + Economic Calendar Surprise + General Sentiment.
-        """
-        if self.data is None or self.data.empty:
-            return {"signal": "HOLD", "reason": "Historical data missing."}
-
-        # 1. Prepare Latest Price Data
-        new_bar = self.data_feed.fetch_realtime_bar(self.symbol, self.interval)
-        if new_bar.empty:
-            return {"signal": "HOLD", "reason": f"{self.symbol}: Failed to fetch real-time bar."}
+            # Sentiment too neutral for confirmation. Hold.
+            return {"signal": "HOLD", "reason": f"HOLD: Technical SELL bias lacks strong sentiment confirmation ({general_sentiment:.3f})."}
             
-        temp_data = self.data.copy()
-        temp_data.loc[new_bar.name] = new_bar.copy()
-        temp_data.sort_index(inplace=True)
-        # Recalculate indicators on the combined dataset
-        macd_instance = MACD(close=temp_data['close'], window_fast=self.MACD_FAST, window_slow=self.MACD_SLOW, window_sign=self.MACD_SIGNAL, fillna=False) 
-        stoch_instance = StochasticOscillator(high=temp_data['high'], low=temp_data['low'], close=temp_data['close'], window=self.STOCH_K, smooth_window=self.STOCH_D, fillna=False) 
-        self.data = temp_data.copy()
-        self.data['MACD_Hist'] = macd_instance.macd_diff() 
-        self.data['Stoch_K'] = stoch_instance.stoch() 
-        self.data['Stoch_D'] = stoch_instance.stoch_signal() 
-        self.data.dropna(subset=['MACD_Hist', 'Stoch_K', 'Stoch_D'], inplace=True)
-        
-        if len(self.data) < 2:
-            return {"signal": "HOLD", "reason": f"{self.symbol}: Not enough data points after latest bar append."}
-            
-        latest_data = self.data.iloc[-1]
-        prev_data = self.data.iloc[-2]
-        latest_close = latest_data['close']
+    return {"signal": "HOLD", "reason": "HOLD: Unknown reason or processing error."}
 
-        # 2. Determine Technical Bias
-        technical_bias = self._determine_technical_bias(latest_data, prev_data)
-            
-        # 3. Fetch Fundamental Data (using pair-specific config)
-        print(f"\n--- Running Step 3.2.1: Checking Economic Calendar Surprise for {self.symbol} ---")
-        calendar_data = self.news_processor.fetch_economic_calendar_surprise(self.symbol, pair_config["economic_countries"])
-        surprise_score = calendar_data['score']
-        surprise_reason = calendar_data['reason']
-        
-        print(f"\n--- Running Step 3.2.2: Fetching General News Sentiment for {self.symbol} ---")
-        search_query = ' OR '.join(pair_config["news_keywords"])
-        general_sentiment = self.news_processor.fetch_general_news_sentiment(self.symbol, pair_config["news_keywords"])
-        
-        # 4. Final Strategy Decision
-        signal = "HOLD"
-        stop_loss, take_profit = None, None
-        entry_price = latest_close 
-        reason = ""
-        
-        # --- LAYER 1: NEWS TRADING MODE (Economic Surprise Override) ---
-        if abs(surprise_score) >= self.SURPRISE_SCORE_THRESHOLD:
-            signal = "BUY" if surprise_score > 0 else "SELL"
-            reason = f"***NEWS TRADE OVERRIDE***: Extreme Economic Surprise detected. Signal based on: {surprise_reason}"
-        
-        # --- LAYER 2: CONFIRMATION TRADING MODE (Tech + General Sentiment) ---
-        elif technical_bias != "NEUTRAL":
-            sentiment_direction = "BUY" if general_sentiment >= self.GENERAL_SENTIMENT_THRESHOLD else \
-                                  "SELL" if general_sentiment <= -self.GENERAL_SENTIMENT_THRESHOLD else \
-                                  "NEUTRAL"
-            
-            if technical_bias == sentiment_direction:
-                signal = technical_bias
-                reason = f"**CONFIRMED {signal}**: Technical signal ({technical_bias}) aligns with strong General Sentiment ({general_sentiment:.3f})."
-                
-            elif sentiment_direction == "NEUTRAL":
-                signal = technical_bias
-                reason = f"**{signal} (Caution)**: Technical signal is clear, but General Sentiment is neutral ({general_sentiment:.3f})."
-                
-            else: # Technical and Sentiment Contradict
-                signal = "HOLD"
-                reason = f"HOLD: Technical bias ({technical_bias}) strongly contradicts General Sentiment ({sentiment_direction} - {general_sentiment:.3f})."
 
-        # --- LAYER 3: DEFAULT HOLD ---
-        else:
-            signal = "HOLD"
-            reason = f"HOLD: Technical bias is NEUTRAL, and General Sentiment is neutral/conflicting ({general_sentiment:.3f}). No high-impact news."
-
-        # 5. Price Calculation
-        if signal == "BUY":
-            stop_loss = entry_price - (self.STOP_LOSS_PIPS / self.PIP_CONVERSION)
-            take_profit = entry_price + (self.TAKE_PROFIT_PIPS / self.PIP_CONVERSION)
-            
-        elif signal == "SELL":
-            stop_loss = entry_price + (self.STOP_LOSS_PIPS / self.PIP_CONVERSION)
-            take_profit = entry_price - (self.TAKE_PROFIT_PIPS / self.PIP_CONVERSION)
-
-        return {
-            "symbol": self.symbol,
-            "signal": signal,
-            "reason": reason,
-            "timestamp": latest_data.name.strftime('%Y-%m-%d %H:%M:%S') if signal != "HOLD" else "N/A",
-            "entry_price": entry_price if signal != "HOLD" else None,
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
-            "sl_pips": self.STOP_LOSS_PIPS,
-            "tp_pips": self.TAKE_PROFIT_PIPS
-        }
-
-# --- Main Execution Function (UPDATED FOR MULTI-PAIR LOOP) ---
 def run_signal_generation_logic():
-    """Initializes and runs the signal generation, backtesting, and email process for ALL USD pairs."""
-    
-    global TRADING_PAIRS
-
-    if not TWELVESDATA_API_KEY:
-        print("FATAL: TWELVESDATA_API_KEY is not set. Cannot fetch data.")
-        return {"signal": "HOLD", "reason": "Missing primary data feed API Key."}
-    
-    market_data_api = TwelvesDataFeed(api_key=TWELVESDATA_API_KEY)
-    news_processor = NewsProcessor()
+    """Main execution loop for all trading pairs."""
+    print("==================================================\n")
+    print(f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("--- Starting Full Signal Generation Cycle ---\n")
     
     all_results = {}
+    completed_trades_count = 0
 
-    for symbol, config in TRADING_PAIRS.items():
+    for pair, config in TRADING_PAIRS.items():
+        print("================================================================================")
+        print(f"### STARTING FULL TRADING CYCLE FOR {pair} ###")
+        print("================================================================================\n")
+        
         try:
-            print("\n" + "="*80)
-            print(f"### STARTING FULL TRADING CYCLE FOR {symbol} ###")
-            print("="*80)
-
-            generator = SignalGenerator(
-                data_feed=market_data_api, 
-                news_processor=news_processor, 
-                symbol=symbol,
-                pair_config=config
-            )
+            print("==================================================")
+            print(f"### STEP 1: INITIALIZING HISTORICAL DATA for {pair} ###")
+            print("==================================================\n")
+            print(f"--- Initializing Historical Data for {pair} ---")
             
-            # 1. Initialize historical data (runs once per pair)
-            print("\n" + "="*50)
-            print(f"### STEP 1: INITIALIZING HISTORICAL DATA for {symbol} ###")
-            print("="*50)
-            generator.initialize_data()
+            # The get_realtime_bar function handles historical fetching
+            df_history = get_realtime_bar(pair, config)
+            if df_history is None:
+                 raise Exception(f"Failed to fetch historical data for {pair}.")
 
-            if generator.data is None or generator.data.empty:
-                print(f"\nFATAL: {symbol} Initialization failed. Skipping pair.")
-                all_results[symbol] = {"signal": "HOLD", "reason": "Historical data initialization failed."}
-                continue
+            # STEP 2: GENERATE REAL-TIME SIGNAL
+            print("==================================================")
+            print(f"### STEP 2: GENERATING UPGRADED REAL-TIME SIGNAL for {pair} ###")
+            print("==================================================\n")
             
-            # 2. Backtest the predicted signals
-            print("\n" + "="*50)
-            print(f"### STEP 2: RUNNING BACKTESTING for {symbol} ###")
-            print("="*50)
-
-            backtester = Backtester(
-                data=generator.data.copy(),
-                fundamental_threshold=generator.GENERAL_SENTIMENT_THRESHOLD, 
-                sl_pips=generator.STOP_LOSS_PIPS,
-                tp_pips=generator.TAKE_PROFIT_PIPS,
-                symbol=symbol # Pass symbol to correctly determine PIP conversion
-            )
-            backtest_results = backtester.run_backtest()
+            result = generate_signal(pair, config)
             
-            print("\n" + "*"*50)
-            print(f"### BACKTEST RESULTS FOR {symbol} ###")
-            print(f"Total Trades Analyzed: {backtest_results.get('total_trades', 0)}")
-            print(f"Net Pips Gained: **{backtest_results.get('net_pips', 0.0):.2f}**")
-            print(f"Profit Factor: **{backtest_results.get('profit_factor', 0.0):.2f}**")
-            print(f"Details: {backtest_results.get('reason', 'Unknown failure.')}")
-            print("*"*50)
+            # STEP 3: NOTIFICATION AND LOGGING
+            all_results[pair] = result
             
-            # ⚠️ CRITICAL FIX: Rate Limit Delay (Per Pair)
-            print("\n" + "="*50)
-            print(f"### PAUSING FOR 60 SECONDS TO AVOID TWELVES DATA RATE LIMIT for {symbol} ###")
-            print(f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            time.sleep(60)
-            print(f"Resuming execution at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            print("="*50 + "\n")
-
-            # 3. Run the real-time signal generation
-            print("\n" + "="*50)
-            print(f"### STEP 3: GENERATING UPGRADED REAL-TIME SIGNAL for {symbol} ###")
-            print("="*50 + "\n")
-
-            signal_result = generator.generate_signal(config)
-            all_results[symbol] = signal_result
-
-            # 4. Print and Email the result (Updated for multi-pair)
-
-            email_body = f"""
-TRADING SIGNAL NOTIFICATION - {signal_result['symbol']} ({generator.interval})
-PAIR: {signal_result['symbol']}
-SIGNAL: {signal_result['signal']}
-TIMESTAMP (Signal Close): {signal_result.get('timestamp', 'N/A')}
---- TRADE DETAILS ---
-ENTRY PRICE: {signal_result.get('entry_price', 'N/A') if signal_result.get('entry_price') is None else f"{signal_result['entry_price']:.5f}"}
-STOP LOSS (SL) PRICE: {signal_result.get('stop_loss', 'N/A') if signal_result.get('stop_loss') is None else f"{signal_result['stop_loss']:.5f}"} ({signal_result.get('sl_pips', 'N/A')} pips)
-TAKE PROFIT (TP) PRICE: {signal_result.get('take_profit', 'N/A') if signal_result.get('take_profit') is None else f"{signal_result['take_profit']:.5f}"} ({signal_result.get('tp_pips', 'N/A')} pips)
-Risk/Reward Ratio: 1:{round(signal_result['tp_pips']/signal_result['sl_pips'], 1)}
-REASON: {signal_result['reason']}
-
---- BACKTEST PERFORMANCE ---
-Net Pips Gained: {backtest_results.get('net_pips', 0.0):.2f}
-Profit Factor: {backtest_results.get('profit_factor', 0.0):.2f}
-"""
-            # Console output
-            print("\n" + "#"*50)
+            print("##################################################")
             print("### 🔔 FINAL TRADING SIGNAL NOTIFICATION 🔔 ###")
-            print(f"PAIR: {signal_result['symbol']}")
-            print(f"SIGNAL: **{signal_result['signal']}**")
-            print(f"Reason: {signal_result['reason']}")
-            print("#"*50 + "\n")
-            
-            if signal_result['signal'] != "HOLD":
-                subject = f"**{signal_result['signal']}** Signal Generated for {signal_result['symbol']}!"
-            else:
-                subject = f"HOLD Signal Generated for {signal_result['symbol']}."
+            print(f"PAIR: {pair}")
+            print(f"SIGNAL: **{result['signal']}**")
+            print(f"Reason: {result['reason']}")
+            print("##################################################\n")
 
-            send_email_notification(
-                subject=subject,
-                body=email_body,
-                recipient=MAIL_RECIPIENT
-            )
+            subject = f"Signal: {result['signal']} for {pair}"
+            body = f"Pair: {pair}\nSignal: {result['signal']}\nReason: {result['reason']}\n\nThis signal was generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}."
+            
+            send_email_notification(subject, body, MAIL_RECIPIENT)
+            
+            if result['signal'] != 'HOLD':
+                 completed_trades_count += 1
+            
+            # Rate limit avoidance
+            print("==================================================")
+            print(f"### PAUSING FOR 60 SECONDS TO AVOID TWELVES DATA RATE LIMIT for {pair} ###")
+            time.sleep(60) 
+            print(f"Resuming execution at: {(datetime.now() + timedelta(seconds=60)).strftime('%Y-%m-%d %H:%M:%S')}")
+            print("==================================================\n")
 
         except Exception as e:
-            error_msg = f"Critical error for {symbol}: {e}"
-            print("\n" + "!"*50)
-            print(f"### 🛑 CRITICAL EXECUTION ERROR FOR {symbol} 🛑 ###")
-            print(error_msg)
-            print("\n--- Detailed Stack Trace ---")
-            traceback.print_exc()
-            print("!"*50 + "\n")
+            error_message = f"An error occurred while processing {pair}: {e}"
+            print(f"ERROR: {error_message}")
+            send_email_notification(f"ERROR processing {pair}", error_message, MAIL_RECIPIENT)
 
-            all_results[symbol] = {"signal": "ERROR", "reason": error_msg}
-            error_subject = f"FATAL: Bot Failed for {symbol}"
-            error_body = f"The trading signal logic encountered a critical error for {symbol}:\n\nError: {e}\n\nTraceback:\n{traceback.format_exc()}"
-            send_email_notification(error_subject, error_body, MAIL_RECIPIENT)
-            
+    print("**************************************************")
+    print("--- Full Cycle Complete ---")
+    print(f"Details: {completed_trades_count} completed trades generated.")
+    print(f"Final Results: {json.dumps(all_results, indent=4)}")
+    print("**************************************************")
+    
     return all_results
+
+# --- Wrapper for background execution (Retained) ---
+def run_signal_generation_logic_wrapper():
+    """Wrapper to handle critical errors during thread execution."""
+    try:
+        run_signal_generation_logic()
+    except Exception as e:
+        print("!"*50)
+        print("### 🛑 CRITICAL EXECUTION ERROR DURING RUNTIME 🛑 ###")
+        print(f"An unexpected error occurred: {e}")
+        print("\n--- Detailed Stack Trace ---")
+        traceback.print_exc()
+        print("!"*50 + "\n")
+
+        error_subject = "FATAL: Trading Bot Execution Failed"
+        error_body = f"The trading signal logic encountered a critical error:\n\nError: {e}\n\nTraceback:\n{traceback.format_exc()}"
+        send_email_notification(error_subject, error_body, MAIL_RECIPIENT)
 
 # --- Flask Routes (Retained) ---
 @app.route('/', methods=['GET'])
@@ -897,15 +512,16 @@ def run_script():
     """
     print("--- Received request to run trading logic (Starting Background Thread) ---")
 
-    thread = Thread(target=run_signal_generation_logic)
+    thread = Thread(target=run_signal_generation_logic_wrapper) 
     thread.start()
 
     response = {
         "status": "Processing started in background",
-        "message": f"The signal generation logic is running asynchronously for {len(TRADING_PAIRS)} pairs. Check the application logs and your email for the final signal output."
+        "message": "The signal generation logic is running asynchronously. Check the application logs and your email for the final signal output."
     }
 
     return jsonify(response), 202
 if __name__ == "__main__":
     print("Starting Flask server for manual execution...")
-    app.run(host='0.0.0.0', port=os.environ.get("PORT", 5000))
+    port = int(os.environ.get('PORT', 5000))
+    app.run(debug=True, host='0.0.0.0', port=port, use_reloader=False)
