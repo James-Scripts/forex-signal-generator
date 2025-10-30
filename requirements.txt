@@ -2,4 +2,12 @@ Flask==3.0.0
 gunicorn==20.1.0
 requests==2.32.3
 pandas==2.2.2
-ta
+# Technical Analysis Library
+ta==0.11.0 
+# Added for efficient array calculations in signal logic
+numpy==2.3.4
+# Added for parsing RSS feeds (e.g., Reuters)
+feedparser==6.0.12
+# smtplib and email are built-in, but these are for the MIME objects
+# explicitly defining them here for clarity, though typically not needed
+# for the standard library components.
