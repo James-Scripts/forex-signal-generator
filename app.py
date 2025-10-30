@@ -28,101 +28,58 @@ TRADINGECONOMICS_API_KEY = os.environ.get("TRADINGECONOMICS_API_KEY")
 # --- RSS Feed URLs ---
 REUTERS_RSS = "https://www.reuters.com/tools/rss" 
 
-# --- Centralized Multi-Pair Configuration ---
-# NOTE: The 'economic_countries' must be URL-safe slugs accepted by your Trading Economics API.
+# --- Centralized USD-Only Multi-Pair Configuration ---
+# All pairs listed here must contain USD.
 TRADING_PAIRS = {
     "EUR/USD": {
         "interval": "1h",
-        "technical_config": "config_eu",
         "economic_countries": ["united states", "euro area"],
-        "news_keywords": ["Eurozone inflation", "US Fed rate", "dollar", "euro"],
+        "news_keywords": ["Eurozone inflation", "US Fed rate", "dollar", "euro", "ECB"],
         "general_sentiment_threshold": 0.35,
         "sl_pips": 25.0,
         "tp_pips": 37.5 
     },
-    "AUD/CAD": {
+    "GBP/USD": {
         "interval": "1h",
-        "technical_config": "config_ac",
-        "economic_countries": ["australia", "canada"],
-        "news_keywords": ["RBA", "BoC", "Australian employment", "Canadian crude"],
-        "general_sentiment_threshold": 0.40,
-        "sl_pips": 20.0,
-        "tp_pips": 30.0
-    },
-    "CAD/CHF": {
-        "interval": "1h",
-        "technical_config": "config_cc",
-        "economic_countries": ["canada", "switzerland"],
-        "news_keywords": ["BoC", "SNB", "Canadian crude", "Swiss safe-haven"],
-        "general_sentiment_threshold": 0.30,
-        "sl_pips": 20.0,
-        "tp_pips": 25.0
-    },
-    "AUD/CHF": {
-        "interval": "1h",
-        "technical_config": "config_ah",
-        "economic_countries": ["australia", "switzerland"],
-        "news_keywords": ["RBA", "SNB", "commodity prices", "Swiss franc"],
-        "general_sentiment_threshold": 0.45,
-        "sl_pips": 25.0,
-        "tp_pips": 40.0
-    },
-    "AUD/JPY": {
-        "interval": "1h",
-        "technical_config": "config_aj",
-        "economic_countries": ["australia", "japan"],
-        "news_keywords": ["RBA", "BoJ", "Yen intervention", "Aussie commodity"],
+        "economic_countries": ["united states", "united kingdom"],
+        "news_keywords": ["BoE rate", "US Fed rate", "dollar", "pound", "Bank of England"],
         "general_sentiment_threshold": 0.38,
         "sl_pips": 30.0,
         "tp_pips": 45.0
     },
-    "EUR/CAD": {
+    "AUD/USD": {
         "interval": "1h",
-        "technical_config": "config_ec",
-        "economic_countries": ["euro area", "canada"],
-        "news_keywords": ["ECB", "BoC", "Eurozone GDP", "Canadian inflation"],
-        "general_sentiment_threshold": 0.35,
+        "economic_countries": ["united states", "australia"],
+        "news_keywords": ["RBA rate", "US Fed rate", "dollar", "aussie", "commodity prices"],
+        "general_sentiment_threshold": 0.30,
         "sl_pips": 25.0,
         "tp_pips": 37.5
     },
-    "EUR/AUD": {
+    "USD/JPY": {
         "interval": "1h",
-        "technical_config": "config_ea",
-        "economic_countries": ["euro area", "australia"],
-        "news_keywords": ["ECB", "RBA", "European growth", "Aussie housing"],
-        "general_sentiment_threshold": 0.42,
-        "sl_pips": 30.0,
-        "tp_pips": 45.0
+        "economic_countries": ["united states", "japan"],
+        "news_keywords": ["BoJ intervention", "US Fed rate", "dollar", "yen", "safe-haven"],
+        "general_sentiment_threshold": 0.40,
+        "sl_pips": 35.0,
+        "tp_pips": 52.5
     },
-    "CAD/JPY": {
+    "USD/CAD": {
         "interval": "1h",
-        "technical_config": "config_cj",
-        "economic_countries": ["canada", "japan"],
-        "news_keywords": ["BoC", "BoJ", "Crude oil", "Yen safe-haven"],
-        "general_sentiment_threshold": 0.30,
+        "economic_countries": ["united states", "canada"],
+        "news_keywords": ["BoC rate", "US Fed rate", "dollar", "loonie", "crude oil"],
+        "general_sentiment_threshold": 0.28,
         "sl_pips": 20.0,
         "tp_pips": 30.0
     },
-    "CHF/JPY": {
+    "USD/CHF": {
         "interval": "1h",
-        "technical_config": "config_hj",
-        "economic_countries": ["switzerland", "japan"],
-        "news_keywords": ["SNB", "BoJ", "Yen intervention", "Swiss inflation"],
-        "general_sentiment_threshold": 0.25,
-        "sl_pips": 20.0,
-        "tp_pips": 25.0
-    },
-    "AUD/USD": {
-        "interval": "1h",
-        "technical_config": "config_au",
-        "economic_countries": ["australia", "united states"],
-        "news_keywords": ["RBA", "Fed", "Australian CPI", "US NFP"],
-        "general_sentiment_threshold": 0.35,
-        "sl_pips": 25.0,
-        "tp_pips": 37.5
+        "economic_countries": ["united states", "switzerland"],
+        "news_keywords": ["SNB rate", "US Fed rate", "dollar", "swiss", "safe-haven"],
+        "general_sentiment_threshold": 0.32,
+        "sl_pips": 30.0,
+        "tp_pips": 45.0
     },
 }
-
 
 # --- EMAIL Configuration (Retained) ---
 MAIL_USERNAME = os.environ.get("MAIL_USERNAME")
@@ -164,7 +121,6 @@ class TwelvesDataFeed:
         """ Fetches historical Forex data using Twelves Data. """
         print(f"DEBUG: Fetching historical {interval} data for {symbol} (Twelves Data)...")
 
-        # Simplified cache check for brevity
         if symbol in self.data_cache:
             return self.data_cache[symbol].copy()
 
@@ -242,7 +198,7 @@ class TwelvesDataFeed:
 
 # --- MultiSourceSentimentProcessor (UPDATED) ---
 class MultiSourceSentimentProcessor:
-    """Combines sentiment from MarketAux and the new News API."""
+    """Combines sentiment from MarketAux and the new News API, filtered by symbol."""
     MARKETAUX_URL = "https://api.marketaux.com/v1/news/all"
     NEWS_API_URL = "https://newsapi.org/v2/everything" 
 
@@ -254,9 +210,12 @@ class MultiSourceSentimentProcessor:
         if not self.marketaux_key:
             return []
 
+        base_currency = symbol.split('/')[0]
+        counter_currency = symbol.split('/')[1]
+        
         params = {
             "api_token": self.marketaux_key,
-            "search": f"{symbol} OR {search_query}", # Search by symbol and keywords
+            "search": f"{base_currency} OR {counter_currency} OR {search_query}",
             "filter_entities": "true",
             "language": "en",
             "limit": 10
@@ -268,17 +227,13 @@ class MultiSourceSentimentProcessor:
             articles = data.get('data', [])
             sentiments = []
             
-            base_currency = symbol.split('/')[0]
-            counter_currency = symbol.split('/')[1]
-            
             for article in articles:
                 entities = article.get('entities', [])
                 for entity in entities:
-                    # Focus on entities that match the base or counter currency
                     entity_symbol = entity.get('symbol')
                     if entity_symbol in [base_currency, counter_currency] and 'sentiment_score' in entity:
                         score = entity['sentiment_score']
-                        # Counter-currency (like USD) sentiment is inverted for the pair.
+                        # Counter-currency sentiment is inverted for the pair.
                         sentiments.append(score if entity_symbol == base_currency else -score) 
             
             return sentiments
@@ -289,9 +244,12 @@ class MultiSourceSentimentProcessor:
         if not self.news_api_key:
             return []
             
+        base_currency = symbol.split('/')[0]
+        counter_currency = symbol.split('/')[1]
+            
         params = {
             "apiKey": self.news_api_key,
-            "q": f"({symbol}) AND ({search_query})", # Target query to the specific pair and keywords
+            "q": f"({base_currency} OR {counter_currency}) AND ({search_query})",
             "language": "en",
             "sortBy": "publishedAt",
             "pageSize": 10
@@ -340,7 +298,6 @@ class NewsProcessor:
     SURPRISE_MULTIPLIER = 5.0 
 
     def __init__(self):
-        # Existing API-based sentiment processors
         self.sentiment_processor = MultiSourceSentimentProcessor(
             marketaux_key=MARKETAUX_API_KEY,
             news_api_key=NEW_NEWS_API_KEY
@@ -363,16 +320,19 @@ class NewsProcessor:
             surprise_percent = (actual - forecast)
             score = np.clip(surprise_percent * self.SURPRISE_MULTIPLIER, -1.0, 1.0)
             
-            # Polarity Adjustment: If the event is from the counter currency's country, invert the score.
+            # Map country to currency (simplified)
             country_map = {
-                "united states": "USD", "euro area": "EUR", "australia": "AUD",
-                "canada": "CAD", "switzerland": "CHF", "japan": "JPY"
+                "united states": "USD", "euro area": "EUR", "united kingdom": "GBP",
+                "australia": "AUD", "canada": "CAD", "switzerland": "CHF", "japan": "JPY"
             }
             
             currency_from_event = country_map.get(country.lower())
 
+            # Polarity Adjustment: If the event is from the counter currency's country, invert the score.
+            # Example: A strong US NFP (positive surprise) is bearish for EUR/USD, but bullish for USD/JPY.
+            # If the base currency benefits from a positive surprise, score remains positive.
             if currency_from_event == counter_currency:
-                score *= -1 # Invert score for counter-currency strength
+                score *= -1 # Invert score because positive news for counter currency is negative for the pair
                 
             return score
             
@@ -393,7 +353,7 @@ class NewsProcessor:
         end_date = datetime.utcnow().strftime('%Y-%m-%d')
         start_date = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d')
         
-        # Dynamic URL construction using the pair's countries
+        # Dynamic URL construction using the pair's countries (URL-safe slugging)
         country_list_str = ','.join(countries).replace(' ', '%20')
         url = (
             f"https://api.tradingeconomics.com/calendar/country/{country_list_str}"
@@ -449,7 +409,7 @@ class NewsProcessor:
         
         all_sentiment_scores = []
         
-        # 1. Existing API-based sentiment (MarketAux/News API)
+        # 1. API-based sentiment (MarketAux/News API)
         api_sentiment = self.sentiment_processor.fetch_realtime_sentiment(symbol, search_query)
         if api_sentiment != 0.0:
             all_sentiment_scores.append(api_sentiment)
@@ -466,7 +426,6 @@ class NewsProcessor:
         for entry in reuters_feed.entries[:20]:
             title = entry.title.lower()
             
-            # Filter for relevance to the current pair
             if not any(k in title for k in keyword_check):
                 continue
             
@@ -490,20 +449,13 @@ class NewsProcessor:
 
 # --- 3. Trading Strategy and Signal Generation ---
 class Backtester:
-    def __init__(self, data: pd.DataFrame, fundamental_threshold: float, sl_pips: float, tp_pips: float):
+    def __init__(self, data: pd.DataFrame, fundamental_threshold: float, sl_pips: float, tp_pips: float, symbol: str):
         self.data = data.copy()
         self.fundamental_threshold = fundamental_threshold
         self.sl_pips = sl_pips
         self.tp_pips = tp_pips
-        self.PIP_CONVERSION = 10000.0 if not self.is_jpy_pair(data) else 100.0
+        self.PIP_CONVERSION = 10000.0 if 'JPY' not in symbol.upper() else 100.0
         
-    def is_jpy_pair(self, data: pd.DataFrame) -> bool:
-        """Heuristic check for JPY pairs based on price scale (if symbol isn't available)."""
-        if data.empty:
-            return False
-        # If price is typically over 100, assume JPY pair (or similar high-value pair)
-        return data['close'].iloc[-1] > 10.0 
-
     def calculate_technical_indicators(self):
         macd_instance = MACD(close=self.data['close'], window_fast=12, window_slow=26, window_sign=9, fillna=False) 
         stoch_instance = StochasticOscillator(high=self.data['high'], low=self.data['low'], close=self.data['close'], window=14, smooth_window=3, fillna=False) 
@@ -516,6 +468,7 @@ class Backtester:
         self.calculate_technical_indicators()
         np.random.seed(42)
         price_diff = self.data['close'].diff().fillna(0)
+        # Simulate sentiment based on price change for backtest
         simulated_sentiment = np.clip(price_diff.rolling(window=10).mean().fillna(0) * 5 + np.random.normal(0, 0.1, len(self.data)), -1, 1)
         self.data['sentiment'] = simulated_sentiment
         signals = pd.Series(index=self.data.index, dtype=str)
@@ -548,7 +501,6 @@ class Backtester:
         trades_list = []
         in_trade = False
 
-        # ... (Rest of backtest logic remains the same, using self.PIP_CONVERSION)
         for i in range(len(self.data)):
             current_bar = self.data.iloc[i]
             if not in_trade and current_bar['signal'] in ['BUY', 'SELL']:
@@ -650,7 +602,6 @@ class SignalGenerator:
         self.GENERAL_SENTIMENT_THRESHOLD = pair_config["general_sentiment_threshold"]
         self.STOP_LOSS_PIPS = pair_config["sl_pips"]
         self.TAKE_PROFIT_PIPS = pair_config["tp_pips"]
-        # PIP conversion will be determined dynamically
         self.PIP_CONVERSION = self.PIP_CONVERSION_DEFAULT 
 
     def initialize_data(self):
@@ -664,7 +615,7 @@ class SignalGenerator:
         self.data = self.data_feed.fetch_historical_data(self.symbol, self.interval, self.lookback_years)
         if self.data is not None and not self.data.empty:
             # Determine PIP conversion dynamically (Heuristic: JPY pairs usually have prices > 100)
-            if self.data['close'].iloc[-1] > 10.0:
+            if 'JPY' in self.symbol.upper():
                  self.PIP_CONVERSION = 100.0
             else:
                  self.PIP_CONVERSION = 10000.0
@@ -806,9 +757,9 @@ class SignalGenerator:
 
 # --- Main Execution Function (UPDATED FOR MULTI-PAIR LOOP) ---
 def run_signal_generation_logic():
-    """Initializes and runs the signal generation, backtesting, and email process for ALL pairs."""
+    """Initializes and runs the signal generation, backtesting, and email process for ALL USD pairs."""
     
-    global TRADING_PAIRS # Access the global configuration
+    global TRADING_PAIRS
 
     if not TWELVESDATA_API_KEY:
         print("FATAL: TWELVESDATA_API_KEY is not set. Cannot fetch data.")
@@ -852,7 +803,8 @@ def run_signal_generation_logic():
                 data=generator.data.copy(),
                 fundamental_threshold=generator.GENERAL_SENTIMENT_THRESHOLD, 
                 sl_pips=generator.STOP_LOSS_PIPS,
-                tp_pips=generator.TAKE_PROFIT_PIPS
+                tp_pips=generator.TAKE_PROFIT_PIPS,
+                symbol=symbol # Pass symbol to correctly determine PIP conversion
             )
             backtest_results = backtester.run_backtest()
             
