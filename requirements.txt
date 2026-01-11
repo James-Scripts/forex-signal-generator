@@ -1,13 +1,19 @@
+# Web Server
 Flask==3.0.0
-gunicorn==20.1.0
-requests==2.32.3
+gunicorn==21.2.0
+
+# OANDA v20 API Connection
+oandapyV20==0.7.2
+
+# Data Analysis & Technical Indicators
 pandas==2.2.2
-# Technical Analysis Library
-ta==0.11.0 
-# Added for efficient array calculations in signal logic
-numpy==2.3.4
-# Added for parsing RSS feeds (e.g., Reuters)
-feedparser==6.0.12
-# smtplib and email are built-in, but these are for the MIME objects
-# explicitly defining them here for clarity, though typically not needed
-# for the standard library components.
+pandas-ta==0.3.14b0
+numpy==1.26.4
+
+# API Communication & Sentiment
+requests==2.32.3
+textblob==0.18.0.post0
+
+# State Management & Helpers
+db-sqlite3==0.0.1
+python-dotenv==1.0.1
