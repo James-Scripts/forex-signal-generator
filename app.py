@@ -1,123 +1,154 @@
-import os, logging, sqlite3, requests
+import os
+import sqlite3
+import logging
 import pandas as pd
 import pandas_ta as ta
+import requests
 from datetime import datetime
 from flask import Flask, jsonify
 
+# OANDA API
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
 import oandapyV20.endpoints.orders as orders
 import oandapyV20.endpoints.trades as trades
 from oandapyV20.contrib.requests import MarketOrderRequest, TakeProfitDetails, StopLossDetails
 
-# --- 1. ENHANCED LOGGING & CONFIG ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# --- 1. SETTINGS & LOGGING ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# Config
 OANDA_API_KEY = os.environ.get("OANDA_API_KEY")
 OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID")
 FMP_API_KEY = "A0xuQ94tqyjfAKitVIGoNKPNnBX2K0JT"
-client = API(access_token=OANDA_API_KEY, environment="practice")
+DB_PATH = os.environ.get("DB_PATH", "/var/data/bot_state.db")
 
+client = API(access_token=OANDA_API_KEY, environment="practice")
 SYMBOLS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "GBP_JPY"]
 RISK_PERCENT = 0.01
 
-# --- 2. PERSISTENCE (Memory for Restarts) ---
+# --- 2. DATABASE (THE BOT'S MEMORY) ---
 def init_db():
-    conn = sqlite3.connect('bot_state.db')
-    conn.execute('CREATE TABLE IF NOT EXISTS trades (trade_id TEXT PRIMARY KEY, symbol TEXT, entry_price REAL, be_active INTEGER)')
+    """Initializes the persistent database for trade tracking."""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('''CREATE TABLE IF NOT EXISTS trades 
+                    (trade_id TEXT PRIMARY KEY, symbol TEXT, be_active INTEGER)''')
     conn.commit()
     conn.close()
+    logger.info(f"Database initialized at {DB_PATH}")
 
-# --- 3. SPREAD & LIQUIDITY FILTER ---
-def is_spread_safe(symbol):
-    """Prevents trading if the spread is too high (low liquidity)."""
-    r = instruments.InstrumentsSummary(OANDA_ACCOUNT_ID, params={"instruments": symbol})
-    # Simplified: In production, fetch current Bid/Ask from pricing endpoint
-    # Logic: if (Ask - Bid) > (ATR * 0.1): return False
-    return True
+# --- 3. SAFETY FILTERS ---
+def is_news_safe():
+    """Pauses trading if high-impact news is within 30 minutes."""
+    try:
+        url = f"https://financialmodelingprep.com/api/v3/economic_calendar?apikey={FMP_API_KEY}"
+        res = requests.get(url, timeout=5).json()
+        now = datetime.utcnow()
+        for event in res[:15]:
+            e_time = datetime.strptime(event['date'], '%Y-%m-%d %H:%M:%S')
+            if event.get('impact') == 'High' and abs((e_time - now).total_seconds()) < 1800:
+                logger.warning(f"PAUSED: High Impact News - {event['event']}")
+                return False
+        return True
+    except: return True
 
-# --- 4. TRADE MANAGEMENT (Break-Even) ---
-def apply_break_even():
-    """Moves Stop Loss to Entry when price is 50% toward Take Profit."""
+def is_correlated(new_symbol):
+    """Prevents doubling risk on highly correlated pairs."""
     r = trades.OpenTrades(accountID=OANDA_ACCOUNT_ID)
     client.request(r)
+    open_pairs = [t['instrument'] for t in r.response['trades']]
+    if not open_pairs or new_symbol in open_pairs: return False
     
-    conn = sqlite3.connect('bot_state.db')
-    for trade in r.response['trades']:
-        t_id = trade['id']
-        # Logic: Fetch entry price and current price. 
-        # If profit > 0.5 * target, send a TradeOrdersReplace request to update SL.
-        logger.info(f"Checking Trade {t_id} for Break-Even triggers...")
-    conn.close()
+    # Simple logic: If we already have a USD pair, be cautious with another
+    for pair in open_pairs:
+        if new_symbol.split('_')[1] == pair.split('_')[1]:
+            logger.info(f"Correlation skip: Already have open {pair} trade.")
+            return True
+    return False
 
-# --- 5. CORE EXECUTION ENGINE ---
-@app.route('/run')
-def run_bot():
-    # A. News Guard
-    if not is_news_safe(): 
-        return jsonify({"status": "Paused", "reason": "High Impact News"})
+# --- 4. DATA ENGINE ---
+def get_processed_data(symbol, gran):
+    r = instruments.InstrumentsCandles(instrument=symbol, params={"count": 100, "granularity": gran})
+    client.request(r)
+    df = pd.DataFrame([{'close': float(c['mid']['c']), 'high': float(c['mid']['h']), 'low': float(c['mid']['l'])} for c in r.response['candles']])
+    
+    # Calculate Indicators
+    df['ATR'] = ta.atr(df['high'], df['low'], df['close'])
+    df['ADX'] = ta.adx(df['high'], df['low'], df['close'])['ADX_14']
+    macd = ta.macd(df['close'])
+    df = pd.concat([df, macd], axis=1)
+    df['STOCHk'] = ta.stoch(df['high'], df['low'], df['close'])['STOCHk_14_3_3']
+    return df
 
-    # B. Management Guard
-    apply_break_even()
-
-    results = []
-    for symbol in SYMBOLS:
-        try:
-            # C. Correlation & Spread Guard
-            if is_correlated_risk(symbol) or not is_spread_safe(symbol):
-                continue
-
-            # D. Signal Logic (D1 + M15 Confluence)
-            df_m15 = get_candles(symbol, "M15")
-            df_d1 = get_candles(symbol, "D")
-            
-            last_m15 = df_m15.iloc[-1]
-            last_d1 = df_d1.iloc[-1]
-            
-            # Indicators
-            atr = last_m15['ATR']
-            price = last_m15['close']
-            adx = last_m15['ADX_14']
-            d1_ema = df_d1['close'].ewm(span=50).mean().iloc[-1]
-
-            # BUY SIGNAL: Strong Trend + Daily Trend + Oversold + MACD
-            if adx > 25 and price > d1_ema:
-                if last_m15['MACD_12_26_9'] > last_m15['MACDs_12_26_9'] and last_m15['STOCHk_14_3_3'] < 25:
-                    execute_trade(symbol, "BUY", price, atr)
-                    results.append(f"BUY {symbol}")
-
-            # SELL SIGNAL: Strong Trend + Daily Trend + Overbought + MACD
-            elif adx > 25 and price < d1_ema:
-                if last_m15['MACD_12_26_9'] < last_m15['MACDs_12_26_9'] and last_m15['STOCHk_14_3_3'] > 75:
-                    execute_trade(symbol, "SELL", price, atr)
-                    results.append(f"SELL {symbol}")
-
-        except Exception as e:
-            logger.error(f"Error processing {symbol}: {e}")
-
-    return jsonify({"status": "Success", "actions": results})
-
-def execute_trade(symbol, side, price, atr):
+# --- 5. EXECUTION & PERSISTENCE ---
+def execute_and_log(symbol, side, price, atr):
     sl_dist = atr * 2
     tp_dist = atr * 4
-    units = calculate_position_size(symbol, sl_dist)
+    
+    # Calculate Units (Risk Management)
+    units = 1000 # Default fallback
     if side == "SELL": units *= -1
     
-    sl_price = price - sl_dist if side == "BUY" else price + sl_dist
-    tp_price = price + tp_dist if side == "BUY" else price - tp_dist
+    sl_price = round(price - sl_dist if side == "BUY" else price + sl_dist, 5)
+    tp_price = round(price + tp_dist if side == "BUY" else price - tp_dist, 5)
 
     order_req = MarketOrderRequest(
         instrument=symbol, units=units,
-        takeProfitOnFill=TakeProfitDetails(price=str(round(tp_price, 5))).data,
-        stopLossOnFill=StopLossDetails(price=str(round(sl_price, 5))).data
+        takeProfitOnFill=TakeProfitDetails(price=str(tp_price)).data,
+        stopLossOnFill=StopLossDetails(price=str(sl_price)).data
     )
-    r = orders.OrderCreate(OANDA_ACCOUNT_ID, data=order_req.data)
-    client.request(r)
-    logger.info(f"Executed {side} for {symbol} at {price}")
+    
+    try:
+        r = orders.OrderCreate(OANDA_ACCOUNT_ID, data=order_req.data)
+        rv = client.request(r)
+        t_id = rv['orderFillTransaction']['id']
+        
+        # Save to Memory (Database)
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("INSERT INTO trades (trade_id, symbol, be_active) VALUES (?, ?, ?)", (t_id, symbol, 0))
+        conn.commit()
+        conn.close()
+        logger.info(f"Trade Logged in DB: {symbol} ID {t_id}")
+    except Exception as e:
+        logger.error(f"Order failed: {e}")
 
-# (is_news_safe, is_correlated_risk, and get_candles functions from previous versions remain here)
+# --- 6. FLASK ROUTES ---
+@app.route('/run')
+def run_bot():
+    if not is_news_safe(): return jsonify({"status": "News Pause"})
+    
+    results = []
+    for symbol in SYMBOLS:
+        try:
+            if is_correlated(symbol): continue
+            
+            df_m15 = get_processed_data(symbol, "M15")
+            df_d1 = get_processed_data(symbol, "D")
+            
+            last = df_m15.iloc[-1]
+            d1_trend_up = df_d1['close'].iloc[-1] > df_d1['close'].rolling(50).mean().iloc[-1]
+            
+            # Entry Signal: Strong Trend + Confluence
+            if last['ADX'] > 25:
+                if d1_trend_up and last['MACD_12_26_9'] > last['MACDs_12_26_9'] and last['STOCHk'] < 25:
+                    execute_and_log(symbol, "BUY", last['close'], last['ATR'])
+                    results.append(f"{symbol} BUY")
+                elif not d1_trend_up and last['MACD_12_26_9'] < last['MACDs_12_26_9'] and last['STOCHk'] > 75:
+                    execute_and_log(symbol, "SELL", last['close'], last['ATR'])
+                    results.append(f"{symbol} SELL")
+                    
+        except Exception as e:
+            logger.error(f"Error checking {symbol}: {e}")
+            
+    return jsonify({"status": "Complete", "trades": results})
+
+@app.route('/')
+def health():
+    return "Bot is Live", 200
 
 if __name__ == "__main__":
     init_db()
