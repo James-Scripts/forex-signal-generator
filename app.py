@@ -13,6 +13,9 @@ import oandapyV20.endpoints.instruments as instruments
 import oandapyV20.endpoints.orders as orders
 import oandapyV20.endpoints.trades as trades
 from oandapyV20.contrib.requests import MarketOrderRequest, TakeProfitDetails, StopLossDetails
+import oandapyV20.endpoints.forexlabs as labs
+
+
 
 # --- 1. SETTINGS & LOGGING ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -59,30 +62,56 @@ def send_telegram_msg(message):
         logger.error(f"Telegram failed: {e}")
 
 # --- 4. SAFETY FILTERS ---
+
+
+
+
 def is_news_safe():
-    """Pauses trading if high-impact news is within 30 minutes using Finnhub."""
-    if not FINNHUB_API_KEY:
-        return True 
+    """Combined news check using both Finnhub and OANDA Labs."""
+    now = datetime.utcnow()
+    
+    # --- CHECK 1: OANDA LABS (Internal) ---
     try:
-        # Finnhub Economic Calendar
-        url = f"https://finnhub.io/api/v1/calendar/economic?token={FINNHUB_API_KEY}"
-        res = requests.get(url, timeout=5).json()
-        events = res.get('economicCalendar', [])
-        now = datetime.utcnow()
+        # Request news for the next hour to be safe
+        params = {"instrument": "EUR_USD", "period": 3600} 
+        r = labs.Calendar(params=params)
+        client.request(r)
         
-        for event in events:
-            # Check for high impact (Finnhub often uses 'high' or impact level 3)
-            if str(event.get('impact')).lower() in ['high', '3']:
-                e_time = datetime.strptime(event['time'], '%Y-%m-%d %H:%M:%S')
-                if abs((e_time - now).total_seconds()) < 1800:
-                    msg = f"⚠️ PAUSED: High Impact News - {event['event']} ({event['country']})"
+        for event in r.response:
+            # OANDA Impact: 1=Low, 2=Medium, 3=High
+            if int(event.get('impact', 0)) == 3:
+                e_ts = event.get('timestamp')
+                if abs(e_ts - now.timestamp()) < 1800:
+                    msg = f"⚠️ OANDA ALERT: {event.get('title')} in 30 mins"
                     logger.warning(msg)
                     send_telegram_msg(msg)
                     return False
-        return True
     except Exception as e:
-        logger.error(f"News check failed: {e}")
-        return True
+        logger.error(f"OANDA news check failed: {e}")
+
+    # --- CHECK 2: FINNHUB (External) ---
+    if FINNHUB_API_KEY:
+        try:
+            url = f"https://finnhub.io/api/v1/calendar/economic?token={FINNHUB_API_KEY}"
+            res = requests.get(url, timeout=5).json()
+            events = res.get('economicCalendar', [])
+            
+            for event in events:
+                if str(event.get('impact')).lower() in ['high', '3']:
+                    e_time = datetime.strptime(event['time'], '%Y-%m-%d %H:%M:%S')
+                    if abs((e_time - now).total_seconds()) < 1800:
+                        msg = f"⚠️ FINNHUB ALERT: {event['event']} in 30 mins"
+                        logger.warning(msg)
+                        send_telegram_msg(msg)
+                        return False
+        except Exception as e:
+            logger.error(f"Finnhub check failed: {e}")
+
+    return True # If both checks pass or fail silently
+
+
+
+
 
 def is_correlated(new_symbol):
     try:
