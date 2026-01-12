@@ -1,19 +1,9 @@
-# Web Server
 Flask==3.0.0
 gunicorn==21.2.0
-
-# OANDA v20 API Connection
 oandapyV20==0.7.2
-
-# Data Analysis & Technical Indicators
 pandas==2.2.2
 numpy==1.26.4
-# Pointing directly to the last stable v1-compatible build
-https://github.com/twopirllc/pandas-ta/archive/refs/heads/main.zip
-
-# API Communication & Sentiment
+ta==0.11.0
 requests==2.32.3
 textblob==0.18.0.post0
-
-# State Management
 python-dotenv==1.0.1
