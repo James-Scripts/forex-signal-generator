@@ -43,22 +43,51 @@ def init_db():
     conn.close()
     logger.info(f"✅ Database initialized at {DB_PATH}")
 
+
+def send_telegram_msg(message):
+    """Sends a notification to your phone via Telegram."""
+    token = os.getenv("TELEGRAM_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+    
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, data=payload, timeout=5)
+    except Exception as e:
+        logger.error(f"Telegram failed: {e}")
+
+
+
+
 # --- 3. SAFETY FILTERS ---
+
 def is_news_safe():
     """Pauses trading if high-impact news is within 30 minutes."""
     try:
         url = f"https://financialmodelingprep.com/api/v3/economic_calendar?apikey={FMP_API_KEY}"
-        res = requests.get(url, timeout=5).json()
+        response = requests.get(url, timeout=5)
+        res = response.json()
+        
+        # FIX: Ensure res is a list before slicing
+        if not isinstance(res, list):
+            logger.warning(f"News API returned unexpected format: {res}")
+            return True # Default to safe if API is weird
+            
         now = datetime.utcnow()
         for event in res[:15]:
             e_time = datetime.strptime(event['date'], '%Y-%m-%d %H:%M:%S')
+            # Check for high impact and 30-minute window
             if event.get('impact') == 'High' and abs((e_time - now).total_seconds()) < 1800:
                 logger.warning(f"PAUSED: High Impact News - {event['event']}")
+                send_telegram_msg(f"⚠️ Trading Paused: High Impact News ({event['event']})")
                 return False
         return True
     except Exception as e:
-        logger.error(f"News check failed, defaulting to safe: {e}")
+        logger.error(f"News check failed: {e}")
         return True
+
 
 def is_correlated(new_symbol):
     """Prevents doubling risk on highly correlated pairs (e.g., two USD pairs)."""
@@ -176,6 +205,29 @@ def run_bot():
 @app.route('/')
 def health():
     return "Bot is Live and Tracking State", 200
+
+@app.route('/dashboard')
+def dashboard():
+    # Use a password in the URL for basic security (e.g., /dashboard?pw=123)
+    password = request.args.get('pw')
+    if password != "your_password_here": 
+        return "Unauthorized", 401
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    # Fetch last 20 trades
+    cursor.execute("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 20")
+    trades = cursor.fetchall()
+    conn.close()
+
+    # Simple HTML Table
+    html = "<h2>Bot Trade History</h2><table border='1' style='width:100%; text-align:left;'>"
+    html += "<tr><th>Time</th><th>Pair</th><th>Side</th><th>Price</th></tr>"
+    for t in trades:
+        html += f"<tr><td>{t['timestamp']}</td><td>{t['symbol']}</td><td>{t['side']}</td><td>{t['price']}</td></tr>"
+    html += "</table>"
+    return html
 
 if __name__ == "__main__":
     init_db()
