@@ -2,10 +2,10 @@ import os
 import sqlite3
 import logging
 import pandas as pd
-import ta  # Using the stable 'ta' library to avoid dependency errors
+import ta
 import requests
 from datetime import datetime
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 # OANDA API
 from oandapyV20 import API
@@ -20,37 +20,37 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Config - Ensure these are set in your Render environment variables
+# Config
 OANDA_API_KEY = os.environ.get("OANDA_API_KEY")
 OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID")
-FMP_API_KEY = "A0xuQ94tqyjfAKitVIGoNKPNnBX2K0JT"
-# For Render, mount a disk at /var/data
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY") # Get free from Finnhub.io
+DASHBOARD_PW = os.environ.get("DASHBOARD_PW", "1234") # Set this in Render Env
+
 DB_PATH = os.environ.get("DB_PATH", "/var/data/bot_state.db")
 
 client = API(access_token=OANDA_API_KEY, environment="practice")
 SYMBOLS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "GBP_JPY"]
 
-# --- 2. DATABASE (THE BOT'S MEMORY) ---
+# --- 2. DATABASE ---
 def init_db():
-    """Initializes the persistent database for trade tracking."""
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
+    # Updated table to store more info for the dashboard
     conn.execute('''CREATE TABLE IF NOT EXISTS trades 
-                    (trade_id TEXT PRIMARY KEY, symbol TEXT, be_active INTEGER)''')
+                    (trade_id TEXT PRIMARY KEY, symbol TEXT, side TEXT, 
+                     price REAL, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
     conn.commit()
     conn.close()
     logger.info(f"✅ Database initialized at {DB_PATH}")
 
-
+# --- 3. TELEGRAM ---
 def send_telegram_msg(message):
-    """Sends a notification to your phone via Telegram."""
-    token = os.getenv("TELEGRAM_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    token = os.environ.get("TELEGRAM_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         return
-    
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
     try:
@@ -58,94 +58,62 @@ def send_telegram_msg(message):
     except Exception as e:
         logger.error(f"Telegram failed: {e}")
 
-
-
-
-# --- 3. SAFETY FILTERS ---
-
+# --- 4. SAFETY FILTERS ---
 def is_news_safe():
-    """Pauses trading if high-impact news is within 30 minutes."""
+    """Pauses trading if high-impact news is within 30 minutes using Finnhub."""
+    if not FINNHUB_API_KEY:
+        return True 
     try:
-        url = f"https://financialmodelingprep.com/api/v3/economic_calendar?apikey={FMP_API_KEY}"
-        response = requests.get(url, timeout=5)
-        res = response.json()
-        
-        # FIX: Ensure res is a list before slicing
-        if not isinstance(res, list):
-            logger.warning(f"News API returned unexpected format: {res}")
-            return True # Default to safe if API is weird
-            
+        # Finnhub Economic Calendar
+        url = f"https://finnhub.io/api/v1/calendar/economic?token={FINNHUB_API_KEY}"
+        res = requests.get(url, timeout=5).json()
+        events = res.get('economicCalendar', [])
         now = datetime.utcnow()
-        for event in res[:15]:
-            e_time = datetime.strptime(event['date'], '%Y-%m-%d %H:%M:%S')
-            # Check for high impact and 30-minute window
-            if event.get('impact') == 'High' and abs((e_time - now).total_seconds()) < 1800:
-                logger.warning(f"PAUSED: High Impact News - {event['event']}")
-                send_telegram_msg(f"⚠️ Trading Paused: High Impact News ({event['event']})")
-                return False
+        
+        for event in events:
+            # Check for high impact (Finnhub often uses 'high' or impact level 3)
+            if str(event.get('impact')).lower() in ['high', '3']:
+                e_time = datetime.strptime(event['time'], '%Y-%m-%d %H:%M:%S')
+                if abs((e_time - now).total_seconds()) < 1800:
+                    msg = f"⚠️ PAUSED: High Impact News - {event['event']} ({event['country']})"
+                    logger.warning(msg)
+                    send_telegram_msg(msg)
+                    return False
         return True
     except Exception as e:
         logger.error(f"News check failed: {e}")
         return True
 
-
 def is_correlated(new_symbol):
-    """Prevents doubling risk on highly correlated pairs (e.g., two USD pairs)."""
     try:
         r = trades.OpenTrades(accountID=OANDA_ACCOUNT_ID)
         client.request(r)
         open_pairs = [t['instrument'] for t in r.response['trades']]
-        if not open_pairs: return False
-        
-        new_base, new_quote = new_symbol.split('_')
+        new_quote = new_symbol.split('_')[1]
         for pair in open_pairs:
-            p_base, p_quote = pair.split('_')
-            if new_quote == p_quote: # Check if same quote currency like USD
-                logger.info(f"Correlation skip: Already have open {pair} trade.")
+            if new_quote == pair.split('_')[1]:
+                logger.info(f"Correlation skip: {pair} already open.")
                 return True
         return False
     except: return False
 
-# --- 4. DATA ENGINE (Using stable 'ta' library) ---
+# --- 5. DATA & EXECUTION ---
 def get_processed_data(symbol, gran):
     params = {"count": 100, "granularity": gran}
     r = instruments.InstrumentsCandles(instrument=symbol, params=params)
     client.request(r)
-    
-    df = pd.DataFrame([
-        {
-            'close': float(c['mid']['c']), 
-            'high': float(c['mid']['h']), 
-            'low': float(c['mid']['l'])
-        } for c in r.response['candles'] if c['complete']
-    ])
-    
-    # ATR (Volatility)
-    df['ATR'] = ta.volatility.AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14).average_true_range()
-    
-    # ADX (Trend Strength)
-    adx_ind = ta.trend.ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=14)
-    df['ADX'] = adx_ind.adx()
-    
-    # MACD (Momentum)
-    macd_ind = ta.trend.MACD(close=df['close'])
-    df['MACD'] = macd_ind.macd()
-    df['MACD_Signal'] = macd_ind.macd_signal()
-    
-    # Stochastic (Overbought/Oversold)
-    stoch_ind = ta.momentum.StochasticOscillator(high=df['high'], low=df['low'], close=df['close'], window=14, smooth_window=3)
-    df['STOCHk'] = stoch_ind.stoch()
-    
+    df = pd.DataFrame([{'close': float(c['mid']['c']), 'high': float(c['mid']['h']), 'low': float(c['mid']['l'])} 
+                       for c in r.response['candles'] if c['complete']])
+    df['ATR'] = ta.volatility.AverageTrueRange(high=df['high'], low=df['low'], close=df['close']).average_true_range()
+    df['ADX'] = ta.trend.ADXIndicator(high=df['high'], low=df['low'], close=df['close']).adx()
+    macd = ta.trend.MACD(close=df['close'])
+    df['MACD'], df['MACD_S'] = macd.macd(), macd.macd_signal()
+    df['STOCHk'] = ta.momentum.StochasticOscillator(high=df['high'], low=df['low'], close=df['close']).stoch()
     return df
 
-# --- 5. EXECUTION & PERSISTENCE ---
 def execute_and_log(symbol, side, price, atr):
-    sl_dist = atr * 2
-    tp_dist = atr * 4
-    
-    units = 1000 # Example fixed units
-    if side == "SELL": units *= -1
-    
+    sl_dist, tp_dist = atr * 2, atr * 4
+    units = 1000 if side == "BUY" else -1000
     sl_price = round(price - sl_dist if side == "BUY" else price + sl_dist, 5)
     tp_price = round(price + tp_dist if side == "BUY" else price - tp_dist, 5)
 
@@ -154,80 +122,61 @@ def execute_and_log(symbol, side, price, atr):
         takeProfitOnFill=TakeProfitDetails(price=str(tp_price)).data,
         stopLossOnFill=StopLossDetails(price=str(sl_price)).data
     )
-    
     try:
         r = orders.OrderCreate(OANDA_ACCOUNT_ID, data=order_req.data)
         rv = client.request(r)
         t_id = rv['orderFillTransaction']['id']
         
-        # Save to Persistent Memory
+        # Save to DB
         conn = sqlite3.connect(DB_PATH)
-        conn.execute("INSERT INTO trades (trade_id, symbol, be_active) VALUES (?, ?, ?)", (t_id, symbol, 0))
+        conn.execute("INSERT INTO trades (trade_id, symbol, side, price) VALUES (?, ?, ?, ?)", 
+                     (t_id, symbol, side, price))
         conn.commit()
         conn.close()
-        logger.info(f"🚀 {side} Order Executed & Logged: {symbol} ID {t_id}")
+        
+        send_telegram_msg(f"🚀 *{side}* {symbol} @ {price}\nSL: {sl_price} | TP: {tp_price}")
+        logger.info(f"Order Executed: {t_id}")
     except Exception as e:
         logger.error(f"Order failed: {e}")
 
-# --- 6. FLASK ROUTES ---
+# --- 6. ROUTES ---
 @app.route('/run')
 def run_bot():
-    if not is_news_safe(): 
-        return jsonify({"status": "Paused", "reason": "High Impact News"})
-    
+    if not is_news_safe(): return jsonify({"status": "Paused", "reason": "News"})
     results = []
     for symbol in SYMBOLS:
         try:
             if is_correlated(symbol): continue
-            
-            df_m15 = get_processed_data(symbol, "M15")
-            df_d1 = get_processed_data(symbol, "D")
-            
+            df_m15, df_d1 = get_processed_data(symbol, "M15"), get_processed_data(symbol, "D")
             last = df_m15.iloc[-1]
-            # D1 50-period SMA for trend filter
-            d1_sma50 = df_d1['close'].rolling(50).mean().iloc[-1]
-            d1_trend_up = df_d1['close'].iloc[-1] > d1_sma50
+            d1_trend_up = df_d1['close'].iloc[-1] > df_d1['close'].rolling(50).mean().iloc[-1]
             
-            # Entry Signal: Trend Strength (ADX) + Momentum (MACD) + Reversal (Stoch)
             if last['ADX'] > 25:
-                if d1_trend_up and last['MACD'] > last['MACD_Signal'] and last['STOCHk'] < 25:
+                if d1_trend_up and last['MACD'] > last['MACD_S'] and last['STOCHk'] < 25:
                     execute_and_log(symbol, "BUY", last['close'], last['ATR'])
                     results.append(f"{symbol} BUY")
-                elif not d1_trend_up and last['MACD'] < last['MACD_Signal'] and last['STOCHk'] > 75:
+                elif not d1_trend_up and last['MACD'] < last['MACD_S'] and last['STOCHk'] > 75:
                     execute_and_log(symbol, "SELL", last['close'], last['ATR'])
                     results.append(f"{symbol} SELL")
-                    
-        except Exception as e:
-            logger.error(f"Error checking {symbol}: {e}")
-            
-    return jsonify({"status": "Complete", "trades_opened": results})
-
-@app.route('/')
-def health():
-    return "Bot is Live and Tracking State", 200
+        except Exception as e: logger.error(f"Error {symbol}: {e}")
+    return jsonify({"status": "Complete", "trades": results})
 
 @app.route('/dashboard')
 def dashboard():
-    # Use a password in the URL for basic security (e.g., /dashboard?pw=123)
-    password = request.args.get('pw')
-    if password != "your_password_here": 
-        return "Unauthorized", 401
+    if request.args.get('pw') != DASHBOARD_PW: return "Unauthorized", 401
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 20", conn)
+        conn.close()
+        return f"""
+        <html><head><style>body{{font-family:sans-serif; padding:20px;}} table{{width:100%; border-collapse:collapse;}} 
+        th,td{{padding:10px; border:1px solid #ddd; text-align:left;}} th{{background:#f4f4f4;}}</style></head>
+        <body><h2>Trade Dashboard</h2>{df.to_html(index=False)}</body></html>
+        """
+    except Exception as e: return str(e)
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    # Fetch last 20 trades
-    cursor.execute("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 20")
-    trades = cursor.fetchall()
-    conn.close()
-
-    # Simple HTML Table
-    html = "<h2>Bot Trade History</h2><table border='1' style='width:100%; text-align:left;'>"
-    html += "<tr><th>Time</th><th>Pair</th><th>Side</th><th>Price</th></tr>"
-    for t in trades:
-        html += f"<tr><td>{t['timestamp']}</td><td>{t['symbol']}</td><td>{t['side']}</td><td>{t['price']}</td></tr>"
-    html += "</table>"
-    return html
+@app.route('/')
+def health(): return "Bot Active", 200
 
 if __name__ == "__main__":
     init_db()
