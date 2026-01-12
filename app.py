@@ -2,7 +2,7 @@ import os
 import sqlite3
 import logging
 import pandas as pd
-import pandas_ta as ta
+import ta  # Using the stable 'ta' library to avoid dependency errors
 import requests
 from datetime import datetime
 from flask import Flask, jsonify
@@ -20,26 +20,28 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Config
+# Config - Ensure these are set in your Render environment variables
 OANDA_API_KEY = os.environ.get("OANDA_API_KEY")
 OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID")
 FMP_API_KEY = "A0xuQ94tqyjfAKitVIGoNKPNnBX2K0JT"
+# For Render, mount a disk at /var/data
 DB_PATH = os.environ.get("DB_PATH", "/var/data/bot_state.db")
 
 client = API(access_token=OANDA_API_KEY, environment="practice")
 SYMBOLS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "GBP_JPY"]
-RISK_PERCENT = 0.01
 
 # --- 2. DATABASE (THE BOT'S MEMORY) ---
 def init_db():
     """Initializes the persistent database for trade tracking."""
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute('''CREATE TABLE IF NOT EXISTS trades 
                     (trade_id TEXT PRIMARY KEY, symbol TEXT, be_active INTEGER)''')
     conn.commit()
     conn.close()
-    logger.info(f"Database initialized at {DB_PATH}")
+    logger.info(f"✅ Database initialized at {DB_PATH}")
 
 # --- 3. SAFETY FILTERS ---
 def is_news_safe():
@@ -54,34 +56,57 @@ def is_news_safe():
                 logger.warning(f"PAUSED: High Impact News - {event['event']}")
                 return False
         return True
-    except: return True
+    except Exception as e:
+        logger.error(f"News check failed, defaulting to safe: {e}")
+        return True
 
 def is_correlated(new_symbol):
-    """Prevents doubling risk on highly correlated pairs."""
-    r = trades.OpenTrades(accountID=OANDA_ACCOUNT_ID)
-    client.request(r)
-    open_pairs = [t['instrument'] for t in r.response['trades']]
-    if not open_pairs or new_symbol in open_pairs: return False
-    
-    # Simple logic: If we already have a USD pair, be cautious with another
-    for pair in open_pairs:
-        if new_symbol.split('_')[1] == pair.split('_')[1]:
-            logger.info(f"Correlation skip: Already have open {pair} trade.")
-            return True
-    return False
+    """Prevents doubling risk on highly correlated pairs (e.g., two USD pairs)."""
+    try:
+        r = trades.OpenTrades(accountID=OANDA_ACCOUNT_ID)
+        client.request(r)
+        open_pairs = [t['instrument'] for t in r.response['trades']]
+        if not open_pairs: return False
+        
+        new_base, new_quote = new_symbol.split('_')
+        for pair in open_pairs:
+            p_base, p_quote = pair.split('_')
+            if new_quote == p_quote: # Check if same quote currency like USD
+                logger.info(f"Correlation skip: Already have open {pair} trade.")
+                return True
+        return False
+    except: return False
 
-# --- 4. DATA ENGINE ---
+# --- 4. DATA ENGINE (Using stable 'ta' library) ---
 def get_processed_data(symbol, gran):
-    r = instruments.InstrumentsCandles(instrument=symbol, params={"count": 100, "granularity": gran})
+    params = {"count": 100, "granularity": gran}
+    r = instruments.InstrumentsCandles(instrument=symbol, params=params)
     client.request(r)
-    df = pd.DataFrame([{'close': float(c['mid']['c']), 'high': float(c['mid']['h']), 'low': float(c['mid']['l'])} for c in r.response['candles']])
     
-    # Calculate Indicators
-    df['ATR'] = ta.atr(df['high'], df['low'], df['close'])
-    df['ADX'] = ta.adx(df['high'], df['low'], df['close'])['ADX_14']
-    macd = ta.macd(df['close'])
-    df = pd.concat([df, macd], axis=1)
-    df['STOCHk'] = ta.stoch(df['high'], df['low'], df['close'])['STOCHk_14_3_3']
+    df = pd.DataFrame([
+        {
+            'close': float(c['mid']['c']), 
+            'high': float(c['mid']['h']), 
+            'low': float(c['mid']['l'])
+        } for c in r.response['candles'] if c['complete']
+    ])
+    
+    # ATR (Volatility)
+    df['ATR'] = ta.volatility.AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14).average_true_range()
+    
+    # ADX (Trend Strength)
+    adx_ind = ta.trend.ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=14)
+    df['ADX'] = adx_ind.adx()
+    
+    # MACD (Momentum)
+    macd_ind = ta.trend.MACD(close=df['close'])
+    df['MACD'] = macd_ind.macd()
+    df['MACD_Signal'] = macd_ind.macd_signal()
+    
+    # Stochastic (Overbought/Oversold)
+    stoch_ind = ta.momentum.StochasticOscillator(high=df['high'], low=df['low'], close=df['close'], window=14, smooth_window=3)
+    df['STOCHk'] = stoch_ind.stoch()
+    
     return df
 
 # --- 5. EXECUTION & PERSISTENCE ---
@@ -89,8 +114,7 @@ def execute_and_log(symbol, side, price, atr):
     sl_dist = atr * 2
     tp_dist = atr * 4
     
-    # Calculate Units (Risk Management)
-    units = 1000 # Default fallback
+    units = 1000 # Example fixed units
     if side == "SELL": units *= -1
     
     sl_price = round(price - sl_dist if side == "BUY" else price + sl_dist, 5)
@@ -107,19 +131,20 @@ def execute_and_log(symbol, side, price, atr):
         rv = client.request(r)
         t_id = rv['orderFillTransaction']['id']
         
-        # Save to Memory (Database)
+        # Save to Persistent Memory
         conn = sqlite3.connect(DB_PATH)
         conn.execute("INSERT INTO trades (trade_id, symbol, be_active) VALUES (?, ?, ?)", (t_id, symbol, 0))
         conn.commit()
         conn.close()
-        logger.info(f"Trade Logged in DB: {symbol} ID {t_id}")
+        logger.info(f"🚀 {side} Order Executed & Logged: {symbol} ID {t_id}")
     except Exception as e:
         logger.error(f"Order failed: {e}")
 
 # --- 6. FLASK ROUTES ---
 @app.route('/run')
 def run_bot():
-    if not is_news_safe(): return jsonify({"status": "News Pause"})
+    if not is_news_safe(): 
+        return jsonify({"status": "Paused", "reason": "High Impact News"})
     
     results = []
     for symbol in SYMBOLS:
@@ -130,25 +155,27 @@ def run_bot():
             df_d1 = get_processed_data(symbol, "D")
             
             last = df_m15.iloc[-1]
-            d1_trend_up = df_d1['close'].iloc[-1] > df_d1['close'].rolling(50).mean().iloc[-1]
+            # D1 50-period SMA for trend filter
+            d1_sma50 = df_d1['close'].rolling(50).mean().iloc[-1]
+            d1_trend_up = df_d1['close'].iloc[-1] > d1_sma50
             
-            # Entry Signal: Strong Trend + Confluence
+            # Entry Signal: Trend Strength (ADX) + Momentum (MACD) + Reversal (Stoch)
             if last['ADX'] > 25:
-                if d1_trend_up and last['MACD_12_26_9'] > last['MACDs_12_26_9'] and last['STOCHk'] < 25:
+                if d1_trend_up and last['MACD'] > last['MACD_Signal'] and last['STOCHk'] < 25:
                     execute_and_log(symbol, "BUY", last['close'], last['ATR'])
                     results.append(f"{symbol} BUY")
-                elif not d1_trend_up and last['MACD_12_26_9'] < last['MACDs_12_26_9'] and last['STOCHk'] > 75:
+                elif not d1_trend_up and last['MACD'] < last['MACD_Signal'] and last['STOCHk'] > 75:
                     execute_and_log(symbol, "SELL", last['close'], last['ATR'])
                     results.append(f"{symbol} SELL")
                     
         except Exception as e:
             logger.error(f"Error checking {symbol}: {e}")
             
-    return jsonify({"status": "Complete", "trades": results})
+    return jsonify({"status": "Complete", "trades_opened": results})
 
 @app.route('/')
 def health():
-    return "Bot is Live", 200
+    return "Bot is Live and Tracking State", 200
 
 if __name__ == "__main__":
     init_db()
