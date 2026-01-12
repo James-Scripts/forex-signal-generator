@@ -7,9 +7,9 @@ oandapyV20==0.7.2
 
 # Data Analysis & Technical Indicators
 pandas==2.2.2
-# Removed exact version to allow Render to find the correct build
-pandas-ta>=0.3.14b0
-numpy<2.0.0
+numpy==1.26.4
+# Pointing directly to the last stable v1-compatible build
+https://github.com/twopirllc/pandas-ta/archive/refs/heads/main.zip
 
 # API Communication & Sentiment
 requests==2.32.3
