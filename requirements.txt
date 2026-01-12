@@ -7,13 +7,13 @@ oandapyV20==0.7.2
 
 # Data Analysis & Technical Indicators
 pandas==2.2.2
-pandas-ta==0.3.14b0
-numpy==1.26.4
+# Removed exact version to allow Render to find the correct build
+pandas-ta>=0.3.14b0
+numpy<2.0.0
 
 # API Communication & Sentiment
 requests==2.32.3
 textblob==0.18.0.post0
 
-# State Management & Helpers
-db-sqlite3==0.0.1
+# State Management
 python-dotenv==1.0.1
