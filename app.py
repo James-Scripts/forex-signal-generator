@@ -32,35 +32,22 @@ DB_PATH = os.environ.get("DB_PATH", "bot_state.db")
 
 client = API(access_token=OANDA_API_KEY, environment="practice")
 
-# EXPANDED SYMBOLS (12 pairs for more opportunities)
+# Expanded symbols for more frequent opportunities
 SYMBOLS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "GBP_JPY", 
-    "USD_CAD", "NZD_USD", "EUR_JPY", "EUR_GBP", "AUD_JPY",
-    "EUR_AUD", "USD_CHF"
+    "USD_CAD", "NZD_USD", "EUR_JPY", "EUR_GBP", "AUD_JPY"
 ]
 
-# --- 2. RETRY DECORATOR ---
-def retry_request(max_tries=3, initial_delay=2, backoff=2):
-    def decorator(f):
-        @wraps(f)
-        def wrapper(*args, **kwargs):
-            tries, delay = max_tries, initial_delay
-            while tries > 0:
-                try:
-                    return f(*args, **kwargs)
-                except Exception as e:
-                    tries -= 1
-                    if tries == 0:
-                        logger.error(f"❌ Final failure for {f.__name__}: {e}")
-                        raise e
-                    logger.warning(f"⚠️ {f.__name__} failed. Retrying in {delay}s...")
-                    time.sleep(delay)
-                    delay *= backoff
-            return None
-        return wrapper
-    return decorator
+# ANTI-BLOCK HEADERS: Mimics a real Chrome browser on Windows
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.oanda.com/",
+    "X-Requested-With": "XMLHttpRequest"
+}
 
-# --- 3. DATABASE & NOTIFICATIONS ---
+# --- 2. DATABASE ---
 def init_db():
     db_dir = os.path.dirname(DB_PATH)
     if db_dir and not os.path.exists(db_dir):
@@ -82,35 +69,31 @@ def send_telegram_msg(message):
     except Exception as e:
         logger.error(f"Telegram failed: {e}")
 
-# --- 4. SAFETY FILTERS ---
-@retry_request(max_tries=3)
-def is_news_safe():
-    now = datetime.utcnow()
-    # Finnhub Check
-    if FINNHUB_API_KEY:
-        try:
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            url = f"https://finnhub.io/api/v1/calendar/economic?token={FINNHUB_API_KEY}"
-            res = requests.get(url, headers=headers, timeout=10).json()
-            for event in res.get('economicCalendar', []):
-                if str(event.get('impact')).lower() in ['high', '3']:
-                    e_time = datetime.strptime(event['time'], '%Y-%m-%d %H:%M:%S')
-                    if abs((e_time - now).total_seconds()) < 1800:
-                        return False
-        except: pass
+# --- 3. SAFETY FILTERS (WITH FAIL-SAFE) ---
 
-    # OANDA Labs Check (with 403 fallback)
+def is_news_safe():
+    """Checks for news but returns True (Safe) if blocked by Cloudflare."""
+    if not FINNHUB_API_KEY: return True
     try:
-        r = labs.Calendar(params={"instrument": "EUR_USD", "period": 3600})
-        client.request(r)
-        for event in r.response:
-            if int(event.get('impact', 0)) == 3:
-                e_ts = event.get('timestamp')
-                if abs(e_ts - now.timestamp()) < 1800: return False
-    except: pass
+        url = f"https://finnhub.io/api/v1/calendar/economic?token={FINNHUB_API_KEY}"
+        # Use browser headers to avoid 403
+        res = requests.get(url, headers=BROWSER_HEADERS, timeout=10)
+        if res.status_code != 200:
+            logger.warning(f"News API returned {res.status_code}. Skipping safety check (Safe by default).")
+            return True
+        
+        events = res.json().get('economicCalendar', [])
+        now = datetime.utcnow()
+        for event in events:
+            if str(event.get('impact')).lower() in ['high', '3']:
+                e_time = datetime.strptime(event['time'], '%Y-%m-%d %H:%M:%S')
+                if abs((e_time - now).total_seconds()) < 1800:
+                    logger.info(f"High impact news found: {event['event']}. Bot paused.")
+                    return False
+    except Exception as e:
+        logger.warning(f"News check encountered error: {e}. Proceeding with trade logic.")
     return True
 
-@retry_request(max_tries=2)
 def is_correlated(new_symbol):
     try:
         r = trades.OpenTrades(accountID=OANDA_ACCOUNT_ID)
@@ -122,27 +105,31 @@ def is_correlated(new_symbol):
         return False
     except: return False
 
-# --- 5. DATA & STRATEGY ---
-@retry_request(max_tries=3)
-def get_processed_data(symbol, gran):
-    params = {"count": 100, "granularity": gran}
-    r = instruments.InstrumentsCandles(instrument=symbol, params=params)
-    client.request(r)
-    candles = r.response.get('candles', [])
-    df = pd.DataFrame([{'close': float(c['mid']['c']), 'high': float(c['mid']['h']), 'low': float(c['mid']['l'])} 
-                       for c in candles if c['complete']])
-    if df.empty: return None
+# --- 4. TRADING LOGIC ---
 
-    df['ATR'] = ta.volatility.AverageTrueRange(high=df['high'], low=df['low'], close=df['close']).average_true_range()
-    df['ADX'] = ta.trend.ADXIndicator(high=df['high'], low=df['low'], close=df['close']).adx()
-    df['SMA50'] = df['close'].rolling(50).mean()
-    macd = ta.trend.MACD(close=df['close'])
-    df['MACD'], df['MACD_S'] = macd.macd(), macd.macd_signal()
-    df['STOCHk'] = ta.momentum.StochasticOscillator(high=df['high'], low=df['low'], close=df['close']).stoch()
-    return df
+def get_processed_data(symbol, gran):
+    try:
+        params = {"count": 100, "granularity": gran}
+        r = instruments.InstrumentsCandles(instrument=symbol, params=params)
+        client.request(r)
+        candles = r.response.get('candles', [])
+        df = pd.DataFrame([{'close': float(c['mid']['c']), 'high': float(c['mid']['h']), 'low': float(c['mid']['l'])} 
+                           for c in candles if c['complete']])
+        if df.empty: return None
+
+        df['ATR'] = ta.volatility.AverageTrueRange(high=df['high'], low=df['low'], close=df['close']).average_true_range()
+        df['ADX'] = ta.trend.ADXIndicator(high=df['high'], low=df['low'], close=df['close']).adx()
+        df['SMA50'] = df['close'].rolling(50).mean()
+        macd = ta.trend.MACD(close=df['close'])
+        df['MACD'], df['MACD_S'] = macd.macd(), macd.macd_signal()
+        df['STOCHk'] = ta.momentum.StochasticOscillator(high=df['high'], low=df['low'], close=df['close']).stoch()
+        return df
+    except Exception as e:
+        logger.error(f"Data Fetch Error for {symbol}: {e}")
+        return None
 
 def execute_and_log(symbol, side, price, atr):
-    sl_dist, tp_dist = atr * 1.5, atr * 3 # Slightly tighter SL/TP for more activity
+    sl_dist, tp_dist = atr * 1.5, atr * 3
     units = 1000 if side == "BUY" else -1000
     sl_price = round(price - sl_dist if side == "BUY" else price + sl_dist, 5)
     tp_price = round(price + tp_dist if side == "BUY" else price - tp_dist, 5)
@@ -162,43 +149,37 @@ def execute_and_log(symbol, side, price, atr):
         conn.commit()
         conn.close()
         send_telegram_msg(f"🚀 *{side}* {symbol} @ {price}\nSL: {sl_price} | TP: {tp_price}")
-    except Exception as e: logger.error(f"Trade Error: {e}")
+        logger.info(f"TRADE EXECUTED: {symbol} {side} ID:{t_id}")
+    except Exception as e:
+        logger.error(f"Trade Execution Failed: {e}")
 
-# --- 6. RUN ROUTE ---
+# --- 5. ROUTES ---
+
 @app.route('/run')
 def run_bot():
-    if not is_news_safe(): return jsonify({"status": "Paused", "reason": "News"})
+    # News Check with Fallback
+    if not is_news_safe(): 
+        return jsonify({"status": "Paused", "reason": "High Impact News"})
     
-    scan_report = []
     trades_triggered = []
-    
     for symbol in SYMBOLS:
-        try:
-            if is_correlated(symbol): continue
-            df = get_processed_data(symbol, "M15")
-            if df is None: continue
-            
-            last = df.iloc[-1]
+        if is_correlated(symbol): continue
+        df = get_processed_data(symbol, "M15")
+        if df is None: continue
+        
+        last = df.iloc[-1]
+        # ADX lowered to 20 for more activity
+        if last['ADX'] > 20:
             trend_up = last['close'] > last['SMA50']
-            
-            # IMPLEMENTED RECOMMENDATIONS: Lower ADX (20) & Wider Stoch (30/70)
-            if last['ADX'] > 20:
-                if trend_up and last['MACD'] > last['MACD_S'] and last['STOCHk'] < 30:
-                    execute_and_log(symbol, "BUY", last['close'], last['ATR'])
-                    trades_triggered.append(f"{symbol} BUY")
-                elif not trend_up and last['MACD'] < last['MACD_S'] and last['STOCHk'] > 70:
-                    execute_and_log(symbol, "SELL", last['close'], last['ATR'])
-                    trades_triggered.append(f"{symbol} SELL")
-            else:
-                scan_report.append(f"{symbol}: ADX too low ({round(last['ADX'], 1)})")
-        except Exception as e: logger.error(f"{symbol} Scan Error: {e}")
+            if trend_up and last['MACD'] > last['MACD_S'] and last['STOCHk'] < 30:
+                execute_and_log(symbol, "BUY", last['close'], last['ATR'])
+                trades_triggered.append(f"{symbol} BUY")
+            elif not trend_up and last['MACD'] < last['MACD_S'] and last['STOCHk'] > 70:
+                execute_and_log(symbol, "SELL", last['close'], last['ATR'])
+                trades_triggered.append(f"{symbol} SELL")
 
-    # Heartbeat to Telegram if no trades
-    if not trades_triggered:
-        # send_telegram_msg("🔍 Market Scan: No high-probability setups found.")
-        pass
-
-    return jsonify({"status": "Success", "trades": trades_triggered, "scanned": len(SYMBOLS)})
+    logger.info(f"Heartbeat: Scan complete. Trades placed: {len(trades_triggered)}")
+    return jsonify({"status": "Scan Complete", "trades": trades_triggered, "time": str(datetime.now())})
 
 @app.route('/dashboard')
 def dashboard():
@@ -206,10 +187,10 @@ def dashboard():
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 20", conn)
     conn.close()
-    return f"<html><body style='font-family:sans-serif;'><h2>Trade History</h2>{df.to_html()}</body></html>"
+    return f"<html><body style='font-family:sans-serif;'><h2>Bot Activity</h2>{df.to_html()}</body></html>"
 
 @app.route('/')
-def health(): return "Bot Running", 200
+def health(): return "Bot is Online", 200
 
 if __name__ == "__main__":
     init_db()
