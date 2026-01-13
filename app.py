@@ -31,11 +31,16 @@ DASHBOARD_PW = os.environ.get("DASHBOARD_PW", "1234")
 DB_PATH = os.environ.get("DB_PATH", "bot_state.db")
 
 client = API(access_token=OANDA_API_KEY, environment="practice")
-SYMBOLS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "GBP_JPY"]
+
+# EXPANDED SYMBOLS (12 pairs for more opportunities)
+SYMBOLS = [
+    "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "GBP_JPY", 
+    "USD_CAD", "NZD_USD", "EUR_JPY", "EUR_GBP", "AUD_JPY",
+    "EUR_AUD", "USD_CHF"
+]
 
 # --- 2. RETRY DECORATOR ---
 def retry_request(max_tries=3, initial_delay=2, backoff=2):
-    """Retries a function with exponential backoff if it fails."""
     def decorator(f):
         @wraps(f)
         def wrapper(*args, **kwargs):
@@ -48,14 +53,14 @@ def retry_request(max_tries=3, initial_delay=2, backoff=2):
                     if tries == 0:
                         logger.error(f"❌ Final failure for {f.__name__}: {e}")
                         raise e
-                    logger.warning(f"⚠️ {f.__name__} failed. Retrying in {delay}s... ({tries} left)")
+                    logger.warning(f"⚠️ {f.__name__} failed. Retrying in {delay}s...")
                     time.sleep(delay)
                     delay *= backoff
             return None
         return wrapper
     return decorator
 
-# --- 3. DATABASE ---
+# --- 3. DATABASE & NOTIFICATIONS ---
 def init_db():
     db_dir = os.path.dirname(DB_PATH)
     if db_dir and not os.path.exists(db_dir):
@@ -66,106 +71,78 @@ def init_db():
                      price REAL, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
     conn.commit()
     conn.close()
-    logger.info(f"✅ Database initialized at {DB_PATH}")
 
-# --- 4. TELEGRAM ---
 def send_telegram_msg(message):
     token = os.environ.get("TELEGRAM_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        return
+    if not token or not chat_id: return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
     try:
-        requests.post(url, data=payload, timeout=5)
+        requests.post(url, data={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}, timeout=5)
     except Exception as e:
         logger.error(f"Telegram failed: {e}")
 
-# --- 5. SAFETY FILTERS (NEWS & CORRELATION) ---
-
+# --- 4. SAFETY FILTERS ---
 @retry_request(max_tries=3)
 def is_news_safe():
-    """Combined news check with better error handling for Cloudflare blocks."""
     now = datetime.utcnow()
-    
-    # --- CHECK 1: FINNHUB (Make this Primary) ---
+    # Finnhub Check
     if FINNHUB_API_KEY:
         try:
-            # We add a User-Agent to help bypass basic bot filters
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+            headers = {'User-Agent': 'Mozilla/5.0'}
             url = f"https://finnhub.io/api/v1/calendar/economic?token={FINNHUB_API_KEY}"
             res = requests.get(url, headers=headers, timeout=10).json()
-            
             for event in res.get('economicCalendar', []):
                 if str(event.get('impact')).lower() in ['high', '3']:
                     e_time = datetime.strptime(event['time'], '%Y-%m-%d %H:%M:%S')
                     if abs((e_time - now).total_seconds()) < 1800:
-                        logger.warning(f"FINNHUB ALERT: {event['event']} soon. Skipping.")
                         return False
-        except Exception as e:
-            logger.error(f"Finnhub check failed (will try OANDA): {e}")
+        except: pass
 
-    # --- CHECK 2: OANDA LABS (Handle the 403 error gracefully) ---
+    # OANDA Labs Check (with 403 fallback)
     try:
-        params = {"instrument": "EUR_USD", "period": 3600} 
-        r = labs.Calendar(params=params)
-        client.request(r) # This is where the 403 happens
-        
+        r = labs.Calendar(params={"instrument": "EUR_USD", "period": 3600})
+        client.request(r)
         for event in r.response:
             if int(event.get('impact', 0)) == 3:
                 e_ts = event.get('timestamp')
-                if abs(e_ts - now.timestamp()) < 1800:
-                    return False
-    except Exception as e:
-        # IMPORTANT: If OANDA blocks us (403), we log it but DON'T stop the bot 
-        # as long as Finnhub is working.
-        logger.warning("OANDA Labs blocked by Cloudflare. Relying on Finnhub only.")
-
+                if abs(e_ts - now.timestamp()) < 1800: return False
+    except: pass
     return True
-
-
 
 @retry_request(max_tries=2)
 def is_correlated(new_symbol):
-    """Prevents opening multiple trades with the same quote currency."""
     try:
         r = trades.OpenTrades(accountID=OANDA_ACCOUNT_ID)
         client.request(r)
         open_pairs = [t['instrument'] for t in r.response['trades']]
         new_quote = new_symbol.split('_')[1]
         for pair in open_pairs:
-            if new_quote == pair.split('_')[1]:
-                logger.info(f"Correlation skip: {pair} already open.")
-                return True
+            if new_quote == pair.split('_')[1]: return True
         return False
-    except: 
-        return False
+    except: return False
 
-# --- 6. DATA & EXECUTION ---
-
+# --- 5. DATA & STRATEGY ---
 @retry_request(max_tries=3)
 def get_processed_data(symbol, gran):
-    """Fetches candles and calculates indicators."""
     params = {"count": 100, "granularity": gran}
     r = instruments.InstrumentsCandles(instrument=symbol, params=params)
     client.request(r)
-    
     candles = r.response.get('candles', [])
     df = pd.DataFrame([{'close': float(c['mid']['c']), 'high': float(c['mid']['h']), 'low': float(c['mid']['l'])} 
                        for c in candles if c['complete']])
-    
     if df.empty: return None
 
     df['ATR'] = ta.volatility.AverageTrueRange(high=df['high'], low=df['low'], close=df['close']).average_true_range()
     df['ADX'] = ta.trend.ADXIndicator(high=df['high'], low=df['low'], close=df['close']).adx()
+    df['SMA50'] = df['close'].rolling(50).mean()
     macd = ta.trend.MACD(close=df['close'])
     df['MACD'], df['MACD_S'] = macd.macd(), macd.macd_signal()
     df['STOCHk'] = ta.momentum.StochasticOscillator(high=df['high'], low=df['low'], close=df['close']).stoch()
     return df
 
 def execute_and_log(symbol, side, price, atr):
-    """Executes market order and logs to DB."""
-    sl_dist, tp_dist = atr * 2, atr * 4
+    sl_dist, tp_dist = atr * 1.5, atr * 3 # Slightly tighter SL/TP for more activity
     units = 1000 if side == "BUY" else -1000
     sl_price = round(price - sl_dist if side == "BUY" else price + sl_dist, 5)
     tp_price = round(price + tp_dist if side == "BUY" else price - tp_dist, 5)
@@ -175,78 +152,65 @@ def execute_and_log(symbol, side, price, atr):
         takeProfitOnFill=TakeProfitDetails(price=str(tp_price)).data,
         stopLossOnFill=StopLossDetails(price=str(sl_price)).data
     )
-    
     try:
         r = orders.OrderCreate(OANDA_ACCOUNT_ID, data=order_req.data)
         rv = client.request(r)
         t_id = rv['orderFillTransaction']['id']
-        
         conn = sqlite3.connect(DB_PATH)
         conn.execute("INSERT INTO trades (trade_id, symbol, side, price) VALUES (?, ?, ?, ?)", 
                      (t_id, symbol, side, price))
         conn.commit()
         conn.close()
-        
         send_telegram_msg(f"🚀 *{side}* {symbol} @ {price}\nSL: {sl_price} | TP: {tp_price}")
-        logger.info(f"Order Executed: {t_id}")
-    except Exception as e:
-        logger.error(f"Order failed for {symbol}: {e}")
+    except Exception as e: logger.error(f"Trade Error: {e}")
 
-# --- 7. FLASK ROUTES ---
-
+# --- 6. RUN ROUTE ---
 @app.route('/run')
 def run_bot():
-    if not is_news_safe(): 
-        return jsonify({"status": "Paused", "reason": "High Impact News Detected"})
+    if not is_news_safe(): return jsonify({"status": "Paused", "reason": "News"})
     
-    results = []
+    scan_report = []
+    trades_triggered = []
+    
     for symbol in SYMBOLS:
         try:
             if is_correlated(symbol): continue
+            df = get_processed_data(symbol, "M15")
+            if df is None: continue
             
-            df_m15 = get_processed_data(symbol, "M15")
-            df_d1 = get_processed_data(symbol, "D")
+            last = df.iloc[-1]
+            trend_up = last['close'] > last['SMA50']
             
-            if df_m15 is None or df_d1 is None: continue
-            
-            last = df_m15.iloc[-1]
-            d1_trend_up = df_d1['close'].iloc[-1] > df_d1['close'].rolling(50).mean().iloc[-1]
-            
-            if last['ADX'] > 25:
-                if d1_trend_up and last['MACD'] > last['MACD_S'] and last['STOCHk'] < 25:
+            # IMPLEMENTED RECOMMENDATIONS: Lower ADX (20) & Wider Stoch (30/70)
+            if last['ADX'] > 20:
+                if trend_up and last['MACD'] > last['MACD_S'] and last['STOCHk'] < 30:
                     execute_and_log(symbol, "BUY", last['close'], last['ATR'])
-                    results.append(f"{symbol} BUY")
-                elif not d1_trend_up and last['MACD'] < last['MACD_S'] and last['STOCHk'] > 75:
+                    trades_triggered.append(f"{symbol} BUY")
+                elif not trend_up and last['MACD'] < last['MACD_S'] and last['STOCHk'] > 70:
                     execute_and_log(symbol, "SELL", last['close'], last['ATR'])
-                    results.append(f"{symbol} SELL")
-        except Exception as e: 
-            logger.error(f"Logic Error for {symbol}: {e}")
-            
-    return jsonify({"status": "Complete", "trades_triggered": results, "timestamp": str(datetime.now())})
+                    trades_triggered.append(f"{symbol} SELL")
+            else:
+                scan_report.append(f"{symbol}: ADX too low ({round(last['ADX'], 1)})")
+        except Exception as e: logger.error(f"{symbol} Scan Error: {e}")
+
+    # Heartbeat to Telegram if no trades
+    if not trades_triggered:
+        # send_telegram_msg("🔍 Market Scan: No high-probability setups found.")
+        pass
+
+    return jsonify({"status": "Success", "trades": trades_triggered, "scanned": len(SYMBOLS)})
 
 @app.route('/dashboard')
 def dashboard():
     if request.args.get('pw') != DASHBOARD_PW: return "Unauthorized", 401
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 20", conn)
-        conn.close()
-        return f"""
-        <html><head><title>Bot Dashboard</title><style>
-        body{{font-family:sans-serif; padding:20px; background:#f9f9f9;}} 
-        table{{width:100%; border-collapse:collapse; background:white;}} 
-        th,td{{padding:12px; border:1px solid #ddd; text-align:left;}} 
-        th{{background:#333; color:white;}}
-        tr:nth-child(even){{background:#f2f2f2;}}
-        </style></head>
-        <body><h2>Last 20 Trades</h2>{df.to_html(index=False)}</body></html>
-        """
-    except Exception as e: return f"Dashboard Error: {str(e)}"
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 20", conn)
+    conn.close()
+    return f"<html><body style='font-family:sans-serif;'><h2>Trade History</h2>{df.to_html()}</body></html>"
 
 @app.route('/')
-def health(): return "Bot is Online", 200
+def health(): return "Bot Running", 200
 
 if __name__ == "__main__":
     init_db()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
