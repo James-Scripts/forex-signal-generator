@@ -3,7 +3,6 @@ import time
 import logging
 import pandas as pd
 import ta
-from datetime import datetime
 from flask import Flask, jsonify
 
 from oandapyV20 import API
@@ -23,7 +22,6 @@ OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID")
 client = API(access_token=OANDA_API_KEY, environment="practice")
 
 SYMBOLS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "GBP_JPY"]
-COOLDOWN = 3600  # 1 hour wait between trades for the same pair
 
 # ---------------- HELPERS ----------------
 
@@ -31,6 +29,8 @@ def precision(symbol):
     return 3 if "JPY" in symbol else 5
 
 def fetch_data(symbol, tf, count):
+    # Connection Protection: Sleep 1 second before every request to avoid "RemoteDisconnected"
+    time.sleep(1) 
     try:
         r = instruments.InstrumentsCandles(symbol, {"granularity": tf, "count": count})
         client.request(r)
@@ -63,17 +63,14 @@ def has_open_position(symbol):
 
 def execute_trade(symbol, side, price, atr):
     if has_open_position(symbol):
-        logger.info(f"Skipping {symbol}: Existing trade.")
+        logger.info(f"Skipping {symbol}: Existing trade found.")
         return False
 
-    # FIXED: Forcing trade size to exactly 5 units to protect your balance
-    units = 5 
-    if side == "SELL": units = -5
+    # HARD LIMIT: 5 Units Only
+    units = 5 if side == "BUY" else -5
 
     prec = precision(symbol)
-    
-    # Using a tighter stop loss (1.0 * ATR) and bigger target (3.0 * ATR)
-    sl_dist = atr * 1.2
+    sl_dist = atr * 1.5
     tp_dist = atr * 3.0
     
     sl = f"{round(price - sl_dist if side=='BUY' else price + sl_dist, prec):.{prec}f}"
@@ -88,10 +85,10 @@ def execute_trade(symbol, side, price, atr):
     try:
         r = orders.OrderCreate(OANDA_ACCOUNT_ID, data=order.data)
         client.request(r)
-        logger.info(f"✅ SUCCESS: {side} {symbol} | Units: {units} | SL: {sl}")
+        logger.info(f"✅ PLACED 5 UNITS: {side} {symbol}")
         return True
     except Exception as e:
-        logger.error(f"❌ REJECTED {symbol}: {e}")
+        logger.error(f"❌ OANDA REJECTED {symbol}: {e}")
         return False
 
 # ---------------- STRATEGY ----------------
@@ -110,24 +107,24 @@ def run_bot():
         # Trend Filter
         h1_bull = h1_curr["close"] > h1_curr["SMA50"]
         
-        # Improved Signal: We want the MACD to cross while RSI is healthy
-        macd_cross_up = m15_prev["MACD"] < m15_prev["MACD_S"] and m15_curr["MACD"] > m15_curr["MACD_S"]
-        macd_cross_down = m15_prev["MACD"] > m15_prev["MACD_S"] and m15_curr["MACD"] < m15_curr["MACD_S"]
+        # MACD Signals
+        macd_up = m15_prev["MACD"] < m15_prev["MACD_S"] and m15_curr["MACD"] > m15_curr["MACD_S"]
+        macd_dn = m15_prev["MACD"] > m15_prev["MACD_S"] and m15_curr["MACD"] < m15_curr["MACD_S"]
 
-        # BUY: Trend is up + MACD crossed up + RSI not overbought
-        if h1_bull and macd_cross_up and m15_curr["RSI"] < 60:
+        if h1_bull and macd_up and m15_curr["RSI"] < 65:
             if execute_trade(symbol, "BUY", m15_curr["close"], m15_curr["ATR"]):
                 trades.append(f"BUY {symbol}")
         
-        # SELL: Trend is down + MACD crossed down + RSI not oversold
-        elif not h1_bull and macd_cross_down and m15_curr["RSI"] > 40:
+        elif not h1_bull and macd_dn and m15_curr["RSI"] > 35:
             if execute_trade(symbol, "SELL", m15_curr["close"], m15_curr["ATR"]):
                 trades.append(f"SELL {symbol}")
+        else:
+            logger.info(f"Scan {symbol}: No setup.")
 
-    return jsonify({"status": "Complete", "trades": trades, "time": str(datetime.now())})
+    return jsonify({"status": "Complete", "trades": trades})
 
 @app.route("/")
-def health(): return "Bot Active - 5 Unit Limit Enabled"
+def health(): return "Bot Online - 5 Unit Limit Locked"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
