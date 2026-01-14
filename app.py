@@ -33,7 +33,7 @@ client = API(access_token=OANDA_API_KEY, environment="practice")
 # Symbols to watch
 SYMBOLS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "GBP_JPY"]
 
-# ANTI-BLOCK HEADERS: Makes the bot look like a real Chrome Browser
+# ANTI-BLOCK HEADERS
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -51,7 +51,13 @@ def init_db():
     conn.commit()
     conn.close()
 
-# --- 3. TRADING LOGIC ---
+# --- 3. HELPER FUNCTIONS ---
+
+def get_precision(symbol):
+    """OANDA requires 3 decimals for JPY pairs and 5 for others."""
+    return 3 if "JPY" in symbol else 5
+
+# --- 4. TRADING LOGIC ---
 
 def get_market_data(symbol):
     """Fetches candles and applies indicators."""
@@ -85,16 +91,20 @@ def get_market_data(symbol):
         return None
 
 def execute_trade(symbol, side, price, atr):
-    """Places a market order with SL and TP."""
+    """Places a market order with SL and TP with correct precision."""
     units = 1000 if side == "BUY" else -1000
     sl_dist = atr * 1.5
     tp_dist = atr * 3.0
     
-    sl_price = round(price - sl_dist if side == "BUY" else price + sl_dist, 5)
-    tp_price = round(price + tp_dist if side == "BUY" else price - tp_dist, 5)
+    # Calculate and round based on symbol precision
+    prec = get_precision(symbol)
+    sl_price = round(price - sl_dist if side == "BUY" else price + sl_dist, prec)
+    tp_price = round(price + tp_dist if side == "BUY" else price - tp_dist, prec)
 
+    # OANDA API requires prices to be strings
     order_req = MarketOrderRequest(
-        instrument=symbol, units=units,
+        instrument=symbol, 
+        units=units,
         takeProfitOnFill=TakeProfitDetails(price=str(tp_price)).data,
         stopLossOnFill=StopLossDetails(price=str(sl_price)).data
     )
@@ -111,18 +121,20 @@ def execute_trade(symbol, side, price, atr):
         conn.commit()
         conn.close()
         
-        logger.info(f"✅ TRADE PLACED: {symbol} {side} at {price}")
+        logger.info(f"✅ TRADE PLACED: {symbol} {side} at {price} (SL: {sl_price}, TP: {tp_price})")
         return True
     except Exception as e:
         logger.error(f"❌ EXECUTION FAILED for {symbol}: {e}")
         return False
 
-# --- 4. FLASK ROUTES ---
+# --- 5. FLASK ROUTES ---
 
 @app.route('/run')
 def run_cycle():
     """Endpoint to trigger a scan (Heartbeat)."""
     results = []
+    logger.info("Heartbeat: Starting market scan...")
+    
     for symbol in SYMBOLS:
         df = get_market_data(symbol)
         if df is None: continue
@@ -137,7 +149,12 @@ def run_cycle():
                 results.append(f"SELL {symbol}")
                 
     logger.info(f"Scan complete. Trades found: {len(results)}")
-    return jsonify({"status": "Success", "trades": results, "time": str(datetime.now())})
+    return jsonify({
+        "status": "Success", 
+        "trades_found": len(results), 
+        "details": results, 
+        "time": str(datetime.now())
+    })
 
 @app.route('/dashboard')
 def view_dashboard():
@@ -145,14 +162,18 @@ def view_dashboard():
     if request.args.get('pw') != DASHBOARD_PW:
         return "Unauthorized", 401
     
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 10", conn)
-    conn.close()
-    return f"<h2>Trade History</h2>{df.to_html()}"
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 20", conn)
+        conn.close()
+        return f"<h2>Bot Trade History (Last 20)</h2>{df.to_html(index=False)}"
+    except Exception as e:
+        return f"Error loading dashboard: {e}"
 
 @app.route('/')
-def health(): return "Bot is Online", 200
+def health(): return "Bot is Online and Monitoring", 200
 
 if __name__ == "__main__":
     init_db()
+    # Port is handled by Render's environment
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
