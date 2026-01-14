@@ -90,18 +90,19 @@ def get_market_data(symbol):
         logger.warning(f"Failed to fetch data for {symbol}: {e}")
         return None
 
-def execute_trade(symbol, side, price, atr):
-    """Places a market order with SL and TP with correct precision."""
-    units = 1000 if side == "BUY" else -1000
-    sl_dist = atr * 1.5
-    tp_dist = atr * 3.0
-    
-    # Calculate and round based on symbol precision
-    prec = get_precision(symbol)
-    sl_price = round(price - sl_dist if side == "BUY" else price + sl_dist, prec)
-    tp_price = round(price + tp_dist if side == "BUY" else price - tp_dist, prec)
 
-    # OANDA API requires prices to be strings
+
+
+
+def execute_trade(symbol, side, price, atr):
+    """Places a market order with SL and TP with updated $5 size."""
+    # REDUCED SIZE: 5 units is approximately $5 of market exposure
+    units = 5 if side == "BUY" else -5 
+    
+    prec = 3 if "JPY" in symbol else 5
+    sl_price = round(price - (atr * 1.5) if side == "BUY" else price + (atr * 1.5), prec)
+    tp_price = round(price + (atr * 3) if side == "BUY" else price - (atr * 3), prec)
+
     order_req = MarketOrderRequest(
         instrument=symbol, 
         units=units,
@@ -110,22 +111,36 @@ def execute_trade(symbol, side, price, atr):
     )
     
     try:
+        # Request the order from OANDA
         r = orders.OrderCreate(OANDA_ACCOUNT_ID, data=order_req.data)
         rv = client.request(r)
-        trade_id = rv['orderFillTransaction']['id']
         
-        # Log to DB
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("INSERT INTO trades (trade_id, symbol, side, price) VALUES (?, ?, ?, ?)", 
-                     (trade_id, symbol, side, price))
-        conn.commit()
-        conn.close()
-        
-        logger.info(f"✅ TRADE PLACED: {symbol} {side} at {price} (SL: {sl_price}, TP: {tp_price})")
-        return True
+        if 'orderFillTransaction' in rv:
+            trade_id = rv['orderFillTransaction']['id']
+            logger.info(f"✅ $5 TRADE PLACED: {symbol} {side} ID:{trade_id}")
+            
+            # DATABASE SAFETY: Only try to save if you've set it up
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                conn.execute("INSERT INTO trades (trade_id, symbol, side, price) VALUES (?, ?, ?, ?)", 
+                             (trade_id, symbol, side, price))
+                conn.commit()
+                conn.close()
+            except sqlite3.OperationalError:
+                logger.warning("⚠️ Trade placed but database table 'trades' not found yet.")
+            
+            return True
+        else:
+            logger.warning(f"⚠️ Order not filled. Response: {rv.get('orderRejectTransaction', {}).get('rejectReason', 'Unknown')}")
+            return False
+            
     except Exception as e:
-        logger.error(f"❌ EXECUTION FAILED for {symbol}: {e}")
+        logger.error(f"❌ EXECUTION FAILED for {symbol}: {str(e)}")
         return False
+
+
+
+
 
 # --- 5. FLASK ROUTES ---
 
