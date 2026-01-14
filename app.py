@@ -28,27 +28,41 @@ SYMBOLS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "GBP_JPY"]
 def precision(symbol):
     return 3 if "JPY" in symbol else 5
 
-def fetch_data(symbol, tf, count):
-    # Connection Protection: Sleep 1 second before every request to avoid "RemoteDisconnected"
-    time.sleep(1) 
-    try:
-        r = instruments.InstrumentsCandles(symbol, {"granularity": tf, "count": count})
-        client.request(r)
-        candles = r.response["candles"]
-        data = [{"close": float(c["mid"]["c"]), "high": float(c["mid"]["h"]), "low": float(c["mid"]["l"])} 
-                for c in candles if c["complete"]]
-        df = pd.DataFrame(data)
-        if len(df) < 50: return None
 
-        df["SMA50"] = ta.trend.sma_indicator(df["close"], 50)
-        macd = ta.trend.MACD(df["close"], 17, 8, 9)
-        df["MACD"], df["MACD_S"] = macd.macd(), macd.macd_signal()
-        df["RSI"] = ta.momentum.rsi(df["close"], 14)
-        df["ATR"] = ta.volatility.average_true_range(df["high"], df["low"], df["close"])
-        return df
-    except Exception as e:
-        logger.error(f"Data error {symbol}: {e}")
-        return None
+
+
+def fetch_data(symbol, tf, count):
+    # Try up to 3 times if the connection drops
+    for attempt in range(3):
+        try:
+            time.sleep(1.5) # Slight pause to respect OANDA limits
+            r = instruments.InstrumentsCandles(symbol, {"granularity": tf, "count": count})
+            client.request(r)
+            candles = r.response["candles"]
+            
+            data = [{"close": float(c["mid"]["c"]), "high": float(c["mid"]["h"]), "low": float(c["mid"]["l"])} 
+                    for c in candles if c["complete"]]
+            
+            df = pd.DataFrame(data)
+            if len(df) < 50: return None
+
+            # Standard Indicators
+            df["SMA50"] = ta.trend.sma_indicator(df["close"], 50)
+            macd = ta.trend.MACD(df["close"], 17, 8, 9)
+            df["MACD"], df["MACD_S"] = macd.macd(), macd.macd_signal()
+            df["RSI"] = ta.momentum.rsi(df["close"], 14)
+            df["ATR"] = ta.volatility.average_true_range(df["high"], df["low"], df["close"])
+            return df
+            
+        except Exception as e:
+            if "RemoteDisconnected" in str(e) and attempt < 2:
+                logger.warning(f"Connection dropped for {symbol}. Retrying ({attempt+1}/3)...")
+                time.sleep(2) # Wait a bit longer on retry
+                continue
+            logger.error(f"Final Data error {symbol}: {e}")
+            return None
+
+
 
 def has_open_position(symbol):
     try:
