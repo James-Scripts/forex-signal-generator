@@ -21,46 +21,35 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Config - Use Environment Variables for security
 OANDA_API_KEY = os.environ.get("OANDA_API_KEY")
 OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID")
 DASHBOARD_PW = os.environ.get("DASHBOARD_PW", "1234")
 DB_PATH = "bot_state.db"
 
-# Initialize OANDA Client
 client = API(access_token=OANDA_API_KEY, environment="practice")
 
-# Symbols to watch
 SYMBOLS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "GBP_JPY"]
-
-# ANTI-BLOCK HEADERS
-BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.oanda.com/",
-    "Connection": "keep-alive"
-}
 
 # --- 2. DATABASE INITIALIZATION ---
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute('''CREATE TABLE IF NOT EXISTS trades 
-                    (trade_id TEXT PRIMARY KEY, symbol TEXT, side TEXT, 
-                     price REAL, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute('''CREATE TABLE IF NOT EXISTS trades 
+                        (trade_id TEXT PRIMARY KEY, symbol TEXT, side TEXT, 
+                         price REAL, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"DB Init Error: {e}")
 
 # --- 3. HELPER FUNCTIONS ---
-
 def get_precision(symbol):
-    """OANDA requires 3 decimals for JPY pairs and 5 for others."""
     return 3 if "JPY" in symbol else 5
 
 # --- 4. TRADING LOGIC ---
 
 def get_market_data(symbol):
-    """Fetches candles and applies indicators."""
+    """Fetches candles and applies filtered indicators."""
     try:
         params = {"count": 100, "granularity": "M15"}
         r = instruments.InstrumentsCandles(instrument=symbol, params=params)
@@ -77,41 +66,43 @@ def get_market_data(symbol):
                 })
         
         df = pd.DataFrame(data)
-        if df.empty: return None
+        if df.empty or len(df) < 50: return None
 
-        # Indicators
-        df['SMA50'] = df['close'].rolling(50).mean()
-        df['ATR'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close']).average_true_range()
-        macd = ta.trend.MACD(df['close'])
+        # --- ADVANCED INDICATORS ---
+        # 1. Trend Filter
+        df['SMA50'] = ta.trend.sma_indicator(df['close'], window=50)
+        
+        # 2. Faster MACD (8, 17, 9) to catch moves early
+        macd = ta.trend.MACD(df['close'], window_slow=17, window_fast=8, window_sign=9)
         df['MACD'], df['MACD_S'] = macd.macd(), macd.macd_signal()
+        
+        # 3. RSI Filter (Strength check)
+        df['RSI'] = ta.momentum.rsi(df['close'], window=14)
+        
+        # 4. Volatility (ATR)
+        df['ATR'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'])
         
         return df
     except Exception as e:
         logger.warning(f"Failed to fetch data for {symbol}: {e}")
         return None
 
-
-
-
-
 def execute_trade(symbol, side, price, atr):
     """Places a market order with SL and TP with updated $5 size."""
-    # REDUCED SIZE: 5 units is approximately $5 of market exposure
     units = 5 if side == "BUY" else -5 
+    prec = get_precision(symbol)
     
-    prec = 3 if "JPY" in symbol else 5
+    # Risk Management: 1.5x ATR Stop Loss, 3x ATR Take Profit
     sl_price = round(price - (atr * 1.5) if side == "BUY" else price + (atr * 1.5), prec)
     tp_price = round(price + (atr * 3) if side == "BUY" else price - (atr * 3), prec)
 
     order_req = MarketOrderRequest(
-        instrument=symbol, 
-        units=units,
+        instrument=symbol, units=units,
         takeProfitOnFill=TakeProfitDetails(price=str(tp_price)).data,
         stopLossOnFill=StopLossDetails(price=str(sl_price)).data
     )
     
     try:
-        # Request the order from OANDA
         r = orders.OrderCreate(OANDA_ACCOUNT_ID, data=order_req.data)
         rv = client.request(r)
         
@@ -119,76 +110,68 @@ def execute_trade(symbol, side, price, atr):
             trade_id = rv['orderFillTransaction']['id']
             logger.info(f"✅ $5 TRADE PLACED: {symbol} {side} ID:{trade_id}")
             
-            # DATABASE SAFETY: Only try to save if you've set it up
-            try:
-                conn = sqlite3.connect(DB_PATH)
-                conn.execute("INSERT INTO trades (trade_id, symbol, side, price) VALUES (?, ?, ?, ?)", 
-                             (trade_id, symbol, side, price))
-                conn.commit()
-                conn.close()
-            except sqlite3.OperationalError:
-                logger.warning("⚠️ Trade placed but database table 'trades' not found yet.")
-            
+            # Save to Database
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("INSERT INTO trades (trade_id, symbol, side, price) VALUES (?, ?, ?, ?)", 
+                         (trade_id, symbol, side, price))
+            conn.commit()
+            conn.close()
             return True
         else:
-            logger.warning(f"⚠️ Order not filled. Response: {rv.get('orderRejectTransaction', {}).get('rejectReason', 'Unknown')}")
+            reason = rv.get('orderRejectTransaction', {}).get('rejectReason', 'Unknown')
+            logger.warning(f"⚠️ Order Reject: {symbol} Reason: {reason}")
             return False
-            
     except Exception as e:
         logger.error(f"❌ EXECUTION FAILED for {symbol}: {str(e)}")
         return False
-
-
-
-
 
 # --- 5. FLASK ROUTES ---
 
 @app.route('/run')
 def run_cycle():
-    """Endpoint to trigger a scan (Heartbeat)."""
+    init_db() # Ensure DB is ready
     results = []
-    logger.info("Heartbeat: Starting market scan...")
+    logger.info("Heartbeat: Starting Filtered Market Scan...")
     
     for symbol in SYMBOLS:
         df = get_market_data(symbol)
         if df is None: continue
         
         curr = df.iloc[-1]
-        # Basic Strategy: Price above SMA50 and MACD Cross
-        if curr['close'] > curr['SMA50'] and curr['MACD'] > curr['MACD_S']:
+        
+        # --- IMPROVED STRATEGY LOGIC ---
+        # BUY Condition: 
+        # 1. Price above SMA50 (Bullish trend)
+        # 2. MACD crosses above Signal
+        # 3. RSI < 65 (Not overbought)
+        if curr['close'] > curr['SMA50'] and curr['MACD'] > curr['MACD_S'] and curr['RSI'] < 65:
             if execute_trade(symbol, "BUY", curr['close'], curr['ATR']):
-                results.append(f"BUY {symbol}")
-        elif curr['close'] < curr['SMA50'] and curr['MACD'] < curr['MACD_S']:
+                results.append(f"BUY {symbol} (RSI: {round(curr['RSI'], 1)})")
+        
+        # SELL Condition: 
+        # 1. Price below SMA50 (Bearish trend)
+        # 2. MACD crosses below Signal
+        # 3. RSI > 35 (Not oversold)
+        elif curr['close'] < curr['SMA50'] and curr['MACD'] < curr['MACD_S'] and curr['RSI'] > 35:
             if execute_trade(symbol, "SELL", curr['close'], curr['ATR']):
-                results.append(f"SELL {symbol}")
+                results.append(f"SELL {symbol} (RSI: {round(curr['RSI'], 1)})")
                 
     logger.info(f"Scan complete. Trades found: {len(results)}")
-    return jsonify({
-        "status": "Success", 
-        "trades_found": len(results), 
-        "details": results, 
-        "time": str(datetime.now())
-    })
+    return jsonify({"status": "Success", "trades_found": len(results), "details": results})
 
 @app.route('/dashboard')
 def view_dashboard():
-    """Secured dashboard to see trade history."""
-    if request.args.get('pw') != DASHBOARD_PW:
-        return "Unauthorized", 401
-    
+    if request.args.get('pw') != DASHBOARD_PW: return "Unauthorized", 401
     try:
         conn = sqlite3.connect(DB_PATH)
         df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp DESC LIMIT 20", conn)
         conn.close()
-        return f"<h2>Bot Trade History (Last 20)</h2>{df.to_html(index=False)}"
-    except Exception as e:
-        return f"Error loading dashboard: {e}"
+        return f"<h2>Bot Trade History</h2>{df.to_html(index=False)}"
+    except: return "No trades recorded yet."
 
 @app.route('/')
-def health(): return "Bot is Online and Monitoring", 200
+def health(): return "Bot is Online", 200
 
 if __name__ == "__main__":
     init_db()
-    # Port is handled by Render's environment
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
