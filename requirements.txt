@@ -7,3 +7,6 @@ ta==0.11.0
 requests==2.32.3
 textblob==0.18.0.post0
 python-dotenv==1.0.1
+openai==1.3.0
+feedparser==6.0.11
+bayesian-optimization==1.5.0
