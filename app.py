@@ -9,7 +9,7 @@ from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
 import oandapyV20.endpoints.orders as orders
 import oandapyV20.endpoints.positions as positions
-from oandapyV20.contrib.requests import MarketOrderRequest, TakeProfitDetails, StopLossDetails
+from oandapyV20.contrib.requests import MarketOrderRequest, TakeProfitDetails, StopLossDetails, TrailingStopLossDetails
 
 # ---------------- SETTINGS ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -28,14 +28,10 @@ SYMBOLS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "GBP_JPY"]
 def precision(symbol):
     return 3 if "JPY" in symbol else 5
 
-
-
-
 def fetch_data(symbol, tf, count):
-    # Try up to 3 times if the connection drops
     for attempt in range(3):
         try:
-            time.sleep(1.5) # Slight pause to respect OANDA limits
+            time.sleep(1.2) 
             r = instruments.InstrumentsCandles(symbol, {"granularity": tf, "count": count})
             client.request(r)
             candles = r.response["candles"]
@@ -46,63 +42,59 @@ def fetch_data(symbol, tf, count):
             df = pd.DataFrame(data)
             if len(df) < 50: return None
 
-            # Standard Indicators
             df["SMA50"] = ta.trend.sma_indicator(df["close"], 50)
             macd = ta.trend.MACD(df["close"], 17, 8, 9)
             df["MACD"], df["MACD_S"] = macd.macd(), macd.macd_signal()
             df["RSI"] = ta.momentum.rsi(df["close"], 14)
             df["ATR"] = ta.volatility.average_true_range(df["high"], df["low"], df["close"])
             return df
-            
-        except Exception as e:
-            if "RemoteDisconnected" in str(e) and attempt < 2:
-                logger.warning(f"Connection dropped for {symbol}. Retrying ({attempt+1}/3)...")
-                time.sleep(2) # Wait a bit longer on retry
-                continue
-            logger.error(f"Final Data error {symbol}: {e}")
-            return None
-
-
+        except Exception:
+            time.sleep(2)
+            continue
+    return None
 
 def has_open_position(symbol):
     try:
         r = positions.PositionDetails(OANDA_ACCOUNT_ID, symbol)
         client.request(r)
-        pos = r.response["position"]
-        return int(pos["long"]["units"]) != 0 or int(pos["short"]["units"]) != 0
+        return True
     except:
         return False
 
-# ---------------- EXECUTION (LOCKED TO 5 UNITS) ----------------
+# ---------------- EXECUTION WITH TRAILING STOP ----------------
 
 def execute_trade(symbol, side, price, atr):
-    if has_open_position(symbol):
-        logger.info(f"Skipping {symbol}: Existing trade found.")
-        return False
+    if has_open_position(symbol): return False
 
-    # HARD LIMIT: 5 Units Only
     units = 5 if side == "BUY" else -5
-
     prec = precision(symbol)
-    sl_dist = atr * 1.5
-    tp_dist = atr * 3.0
     
-    sl = f"{round(price - sl_dist if side=='BUY' else price + sl_dist, prec):.{prec}f}"
-    tp = f"{round(price + tp_dist if side=='BUY' else price - tp_dist, prec):.{prec}f}"
+    # 1. Initial Hard Stop Loss (2.5x ATR)
+    sl_dist = atr * 2.5
+    sl_price = f"{round(price - sl_dist if side=='BUY' else price + sl_dist, prec):.{prec}f}"
+    
+    # 2. Take Profit (Targeting 5x ATR for better Risk/Reward)
+    tp_dist = atr * 5.0
+    tp_price = f"{round(price + tp_dist if side=='BUY' else price - tp_dist, prec):.{prec}f}"
+
+    # 3. Trailing Stop Distance (2.0x ATR)
+    # This distance is fixed when the trade opens and "trails" the price
+    trail_dist = f"{round(atr * 2.0, prec):.{prec}f}"
 
     order = MarketOrderRequest(
-        instrument=symbol, units=units,
-        takeProfitOnFill=TakeProfitDetails(price=tp).data,
-        stopLossOnFill=StopLossDetails(price=sl).data
+        instrument=symbol,
+        units=units,
+        takeProfitOnFill=TakeProfitDetails(price=tp_price).data,
+        stopLossOnFill=StopLossDetails(price=sl_price).data,
+        trailingStopLossOnFill=TrailingStopLossDetails(distance=trail_dist).data
     )
 
     try:
-        r = orders.OrderCreate(OANDA_ACCOUNT_ID, data=order.data)
-        client.request(r)
-        logger.info(f"✅ PLACED 5 UNITS: {side} {symbol}")
+        client.request(orders.OrderCreate(OANDA_ACCOUNT_ID, data=order.data))
+        logger.info(f"🚀 {side} {symbol} | Units: 5 | SL: {sl_price} | Trail: {trail_dist}")
         return True
     except Exception as e:
-        logger.error(f"❌ OANDA REJECTED {symbol}: {e}")
+        logger.error(f"❌ Order Failed: {e}")
         return False
 
 # ---------------- STRATEGY ----------------
@@ -115,30 +107,27 @@ def run_bot():
         m15 = fetch_data(symbol, "M15", 100)
         if h1 is None or m15 is None: continue
 
-        h1_curr = h1.iloc[-1]
-        m15_curr, m15_prev = m15.iloc[-1], m15.iloc[-2]
+        curr = m15.iloc[-1]
+        prev = m15.iloc[-2]
+        h1_trend_up = h1.iloc[-1]["close"] > h1.iloc[-1]["SMA50"]
 
-        # Trend Filter
-        h1_bull = h1_curr["close"] > h1_curr["SMA50"]
-        
-        # MACD Signals
-        macd_up = m15_prev["MACD"] < m15_prev["MACD_S"] and m15_curr["MACD"] > m15_curr["MACD_S"]
-        macd_dn = m15_prev["MACD"] > m15_prev["MACD_S"] and m15_curr["MACD"] < m15_curr["MACD_S"]
+        macd_buy = prev["MACD"] < prev["MACD_S"] and curr["MACD"] > curr["MACD_S"]
+        macd_sell = prev["MACD"] > prev["MACD_S"] and curr["MACD"] < curr["MACD_S"]
 
-        if h1_bull and macd_up and m15_curr["RSI"] < 65:
-            if execute_trade(symbol, "BUY", m15_curr["close"], m15_curr["ATR"]):
+        # BUY: Trend UP + Confirmed MACD Cross + Healthy RSI
+        if h1_trend_up and macd_buy and 40 < curr["RSI"] < 60:
+            if execute_trade(symbol, "BUY", curr["close"], curr["ATR"]):
                 trades.append(f"BUY {symbol}")
         
-        elif not h1_bull and macd_dn and m15_curr["RSI"] > 35:
-            if execute_trade(symbol, "SELL", m15_curr["close"], m15_curr["ATR"]):
+        # SELL: Trend DOWN + Confirmed MACD Cross + Healthy RSI
+        elif not h1_trend_up and macd_sell and 40 < curr["RSI"] < 60:
+            if execute_trade(symbol, "SELL", curr["close"], curr["ATR"]):
                 trades.append(f"SELL {symbol}")
-        else:
-            logger.info(f"Scan {symbol}: No setup.")
 
-    return jsonify({"status": "Complete", "trades": trades})
+    return jsonify({"status": "Complete", "executed": trades})
 
 @app.route("/")
-def health(): return "Bot Online - 5 Unit Limit Locked"
+def health(): return "Bot Active: Trailing Stop Enabled (5 Units)"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
