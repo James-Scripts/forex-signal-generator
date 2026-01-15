@@ -4,9 +4,9 @@ import logging
 import pandas as pd
 import ta
 import feedparser
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from flask import Flask, jsonify
-from openai import OpenAI  # pip install openai
+from openai import OpenAI
 
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
@@ -20,47 +20,60 @@ logger = logging.getLogger()
 
 app = Flask(__name__)
 
-# API Keys from Environment Variables (Set these in Render!)
 OANDA_API_KEY = os.environ.get("OANDA_API_KEY")
 OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-ALPHA_VANTAGE_KEY = "ZTH6HG7SPAT753XH"
 
 client = API(access_token=OANDA_API_KEY, environment="practice")
 ai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 SYMBOLS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "GBP_JPY"]
 
-# ---------------- AI SENTIMENT ENGINE ----------------
+# ---------------- RISK & TIME FILTERS ----------------
+
+def is_market_active():
+    """Active Trading Hours: 08:00 - 17:00 UTC"""
+    now = datetime.utcnow()
+    # Check if it's a weekday
+    if now.weekday() >= 5: return False 
+    return dt_time(8, 0) <= now.time() <= dt_time(17, 0)
+
+def is_weekend_closing_time():
+    """Friday Risk-Off: Close everything 1 hour before market close"""
+    now = datetime.utcnow()
+    # Friday (weekday 4) after 20:00 UTC
+    return now.weekday() == 4 and now.hour >= 20
+
+def close_all_positions():
+    """Safety Protocol: Wipes all open trades before the weekend"""
+    try:
+        for symbol in SYMBOLS:
+            # Check for Long or Short positions
+            data = {"longUnits": "ALL", "shortUnits": "ALL"}
+            r = positions.PositionClose(OANDA_ACCOUNT_ID, symbol, data)
+            client.request(r)
+            logger.warning(f"🧹 Weekend Cleanup: Closed all positions for {symbol}")
+        return True
+    except: return False
+
+# ---------------- AI & DATA HELPERS ----------------
 
 def get_market_sentiment():
-    """Uses GPT-4 to read headlines and return a bias: 'BULLISH', 'BEARISH', or 'NEUTRAL'"""
     try:
-        # 1. Get latest headlines via RSS
         feed = feedparser.parse("https://xml.fxstreet.com/news/rss.xml")
         headlines = [entry.title for entry in feed.entries[:10]]
-        context = "\n".join(headlines)
-
-        # 2. Ask AI for Directional Bias (Focus on USD)
         response = ai_client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are a senior currency strategist. Analyze these headlines and respond with ONLY one word: BULLISH, BEARISH, or NEUTRAL regarding the US Dollar (USD)."},
-                {"role": "user", "content": f"Headlines:\n{context}"}
+                {"role": "system", "content": "Analyze headlines. Reply with ONLY: BULLISH, BEARISH, or NEUTRAL for the USD."},
+                {"role": "user", "content": str(headlines)}
             ]
         )
-        sentiment = response.choices[0].message.content.strip().upper()
-        logger.info(f"🤖 AI Sentiment Analysis: USD is {sentiment}")
-        return sentiment
-    except Exception as e:
-        logger.error(f"AI Sentiment Error: {e}")
-        return "NEUTRAL"
-
-# ---------------- TRADING LOGIC ----------------
+        return response.choices[0].message.content.strip().upper()
+    except: return "NEUTRAL"
 
 def fetch_data(symbol, tf, count):
     try:
-        time.sleep(1)
         r = instruments.InstrumentsCandles(symbol, {"granularity": tf, "count": count})
         client.request(r)
         data = [{"close": float(c["mid"]["c"]), "high": float(c["mid"]["h"]), "low": float(c["mid"]["l"])} 
@@ -74,16 +87,14 @@ def fetch_data(symbol, tf, count):
         return df
     except: return None
 
+# ---------------- TRADING EXECUTION ----------------
+
 def execute_trade(symbol, side, price, atr):
     units = 5 if side == "BUY" else -5
     prec = 3 if "JPY" in symbol else 5
-    
-    # Dynamic ATR protection (Wider stops for news volatility)
-    sl_dist, tp_dist, trail_dist = atr * 3.0, atr * 6.0, atr * 2.5
-    
-    sl_p = f"{round(price - sl_dist if side=='BUY' else price + sl_dist, prec):.{prec}f}"
-    tp_p = f"{round(price + tp_dist if side=='BUY' else price - tp_dist, prec):.{prec}f}"
-    tr_d = f"{round(trail_dist, prec):.{prec}f}"
+    sl_p = f"{round(price - (atr*3) if side=='BUY' else price + (atr*3), prec):.{prec}f}"
+    tp_p = f"{round(price + (atr*6) if side=='BUY' else price - (atr*6), prec):.{prec}f}"
+    tr_d = f"{round(atr*2.5, prec):.{prec}f}"
 
     order = MarketOrderRequest(
         instrument=symbol, units=units,
@@ -92,50 +103,45 @@ def execute_trade(symbol, side, price, atr):
         trailingStopLossOnFill=TrailingStopLossDetails(distance=tr_d).data
     )
     client.request(orders.OrderCreate(OANDA_ACCOUNT_ID, data=order.data))
-    logger.info(f"🚀 EXECUTED {side} {symbol} based on AI Sentiment + Technicals")
+    logger.info(f"✅ Trade Placed: {side} {symbol}")
 
-# ---------------- MAIN APP ----------------
+# ---------------- APP ROUTES ----------------
 
 @app.route("/run")
 def run_bot():
-    # STEP 1: Get AI Bias (What your friend does)
-    usd_bias = get_market_sentiment() 
-    trades_taken = []
+    # 1. Friday Risk-Off Check
+    if is_weekend_closing_time():
+        close_all_positions()
+        return jsonify({"status": "Risk-Off", "message": "Closed all positions for the weekend."})
+
+    # 2. Market Hours Check
+    if not is_market_active():
+        return jsonify({"status": "Paused", "reason": "Outside Active Market Hours (08:00-17:00 UTC)"})
+
+    # 3. AI Sentiment Check
+    usd_bias = get_market_sentiment()
+    executed = []
 
     for symbol in SYMBOLS:
         m15 = fetch_data(symbol, "M15", 100)
         if m15 is None: continue
-        
         curr, prev = m15.iloc[-1], m15.iloc[-2]
-        macd_buy = prev["MACD"] < prev["MACD_S"] and curr["MACD"] > curr["MACD_S"]
-        macd_sell = prev["MACD"] > prev["MACD_S"] and curr["MACD"] < curr["MACD_S"]
 
-        # STEP 2: Align Technicals with AI Sentiment
-        # If USD is BULLISH, we SELL EUR/USD or BUY USD/JPY
-        should_buy = (macd_buy and 40 < curr["RSI"] < 60)
-        should_sell = (macd_sell and 40 < curr["RSI"] < 60)
+        sig_buy = (prev["MACD"] < prev["MACD_S"] and curr["MACD"] > curr["MACD_S"] and 40 < curr["RSI"] < 60)
+        sig_sell = (prev["MACD"] > prev["MACD_S"] and curr["MACD"] < curr["MACD_S"] and 40 < curr["RSI"] < 60)
 
-        # Logic: Only take the trade if Technicals match the AI's News prediction
+        # 4. Strategy Alignment
         if usd_bias == "BULLISH":
-            if symbol in ["USD_JPY"] and should_buy: 
-                execute_trade(symbol, "BUY", curr["close"], curr["ATR"])
-                trades_taken.append(symbol)
-            if symbol in ["EUR_USD", "GBP_USD", "AUD_USD"] and should_sell:
-                execute_trade(symbol, "SELL", curr["close"], curr["ATR"])
-                trades_taken.append(symbol)
-        
+            if symbol == "USD_JPY" and sig_buy: execute_trade(symbol, "BUY", curr["close"], curr["ATR"]); executed.append(symbol)
+            if symbol in ["EUR_USD", "GBP_USD"] and sig_sell: execute_trade(symbol, "SELL", curr["close"], curr["ATR"]); executed.append(symbol)
         elif usd_bias == "BEARISH":
-            if symbol in ["EUR_USD", "GBP_USD", "AUD_USD"] and should_buy:
-                execute_trade(symbol, "BUY", curr["close"], curr["ATR"])
-                trades_taken.append(symbol)
-            if symbol in ["USD_JPY"] and should_sell:
-                execute_trade(symbol, "SELL", curr["close"], curr["ATR"])
-                trades_taken.append(symbol)
+            if symbol in ["EUR_USD", "GBP_USD"] and sig_buy: execute_trade(symbol, "BUY", curr["close"], curr["ATR"]); executed.append(symbol)
+            if symbol == "USD_JPY" and sig_sell: execute_trade(symbol, "SELL", curr["close"], curr["ATR"]); executed.append(symbol)
 
-    return jsonify({"sentiment": usd_bias, "executed": trades_taken})
+    return jsonify({"sentiment": usd_bias, "trades": executed})
 
 @app.route("/")
-def health(): return "AI-Quant Bot: Online & Analyzing News Headlines"
+def health(): return "AI-Quant Master Active: Weekend Risk-Off Mode Enabled."
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
