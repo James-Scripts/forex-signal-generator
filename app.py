@@ -1,5 +1,5 @@
 import os, logging, threading, requests, time, numpy as np, pandas as pd, ta
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from flask import Flask, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -17,7 +17,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOLS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD"]
 BASE_RISK = 0.005
-DAILY_LOSS_LIMIT = 0.02
 PORTFOLIO_LOCK = threading.Lock()
 
 # Global tracking
@@ -29,7 +28,7 @@ client = API(access_token=OANDA_API_KEY, environment="practice")
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | [APEX-V10] | %(message)s")
 
-# ==================== TELEGRAM & PERFORMANCE ====================
+# ==================== TELEGRAM & UTILS ====================
 def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -37,24 +36,26 @@ def send_telegram(msg):
     except Exception as e:
         logging.error(f"Telegram Error: {e}")
 
+def bot_heartbeat():
+    """Sends a simple status update to Telegram to confirm the bot is alive."""
+    send_telegram("💓 Heartbeat: APEX-V10 is active and scanning markets.")
+
 def send_daily_summary():
     global DAILY_TRADE_COUNT, SESSION_START_NAV
     try:
         r = accounts.AccountSummary(OANDA_ACCOUNT_ID); client.request(r)
         curr_nav = float(r.response["account"]["NAV"])
-        pnl = curr_nav - SESSION_START_NAV
-        pnl_pct = (pnl / SESSION_START_NAV) * 100
+        pnl = curr_nav - (SESSION_START_NAV or curr_nav)
+        pnl_pct = (pnl / SESSION_START_NAV * 100) if SESSION_START_NAV else 0
         
         summary = (
-            f"📊 --- DAILY TRADING REPORT ---\n"
-            f"💰 Ending NAV: ${curr_nav:,.2f}\n"
-            f"📈 Net P/L: ${pnl:,.2f} ({pnl_pct:.2f}%)\n"
-            f"🚀 Trades Today: {DAILY_TRADE_COUNT}\n"
-            f"📅 Session: {datetime.now().strftime('%Y-%m-%d')}"
+            f"📊 --- DAILY REPORT ---\n"
+            f"💰 NAV: ${curr_nav:,.2f}\n"
+            f"📈 P/L: ${pnl:,.2f} ({pnl_pct:.2f}%)\n"
+            f"🚀 Trades Today: {DAILY_TRADE_COUNT}"
         )
         send_telegram(summary)
         DAILY_TRADE_COUNT = 0
-        SESSION_START_NAV = curr_nav # Reset baseline for next session
     except Exception as e:
         logging.error(f"Summary Error: {e}")
 
@@ -63,8 +64,7 @@ def scrape_high_impact_news():
     global HIGH_IMPACT_EVENTS
     try:
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, timeout=15)
+        response = requests.get(url, timeout=15)
         xml = response.text
         events = []
         for item in xml.split("<event>")[1:]:
@@ -77,9 +77,9 @@ def scrape_high_impact_news():
                 event_dt = datetime.strptime(dt_str, "%m-%d-%Y %I:%M%p").replace(tzinfo=timezone.utc)
                 events.append({"currency": currency, "title": title, "time": event_dt})
         HIGH_IMPACT_EVENTS = events
-        logging.info(f"Loaded {len(events)} High Impact events.")
+        logging.info(f"Loaded {len(events)} events.")
     except Exception as e:
-        logging.error(f"Calendar Scrape Fail: {e}")
+        logging.error(f"Calendar Fail: {e}")
 
 def is_news_window(symbol):
     base, quote = symbol.split("_")
@@ -87,8 +87,7 @@ def is_news_window(symbol):
     for ev in HIGH_IMPACT_EVENTS:
         if ev["currency"] in (base, quote):
             delta = (ev["time"] - now).total_seconds()
-            if -60 <= delta <= 300: # 1 min before to 5 mins after
-                return True, ev
+            if -60 <= delta <= 300: return True, ev
     return False, None
 
 # ==================== TRADING LOGIC ====================
@@ -102,15 +101,12 @@ def execute_unified_trade(symbol, side, price, atr, nav, trade_type):
     global DAILY_TRADE_COUNT
     try:
         pip = 0.01 if "JPY" in symbol else 0.0001
-        # Position sizing based on 3*ATR stop distance
         units = max(1, int((nav * BASE_RISK) / (atr * 3 * pip)))
         if side == "SELL": units *= -1
 
         prec = 3 if "JPY" in symbol else 5
         sl_price = round(price - atr*3 if side=="BUY" else price + atr*3, prec)
         tp_price = round(price + atr*2.5 if side=="BUY" else price - atr*2.5, prec)
-        
-        # Trailing Stop distance: 1.5 * ATR
         tsl_dist = round(atr * 1.5, prec)
 
         order = MarketOrderRequest(
@@ -119,17 +115,13 @@ def execute_unified_trade(symbol, side, price, atr, nav, trade_type):
             takeProfitOnFill=TakeProfitDetails(price=str(tp_price)).data,
             trailingStopLossOnFill=TrailingStopLossDetails(distance=str(tsl_dist)).data
         )
-        
         client.request(orders.OrderCreate(OANDA_ACCOUNT_ID, data=order.data))
         DAILY_TRADE_COUNT += 1
-        
-        msg = (f"🚀 {trade_type}\n📦 {symbol} {side}\nEntry: {price}\n"
-               f"🛡 SL: {sl_price} | 🎯 TP: {tp_price}\n🔄 Trailing: {tsl_dist} pips")
-        send_telegram(msg)
+        send_telegram(f"🚀 {trade_type}\n📦 {symbol} {side}\nEntry: {price}\n🛡 SL: {sl_price} | 🎯 TP: {tp_price}")
     except Exception as e:
         logging.error(f"Trade Fail: {e}")
 
-def run_apex_unified(symbol, index):
+def run_apex_unified(symbol):
     with PORTFOLIO_LOCK:
         try:
             r = instruments.InstrumentsCandles(symbol, {"granularity": "M15", "count": 50})
@@ -144,13 +136,13 @@ def run_apex_unified(symbol, index):
             acc = accounts.AccountSummary(OANDA_ACCOUNT_ID); client.request(acc)
             nav = float(acc.response["account"]["NAV"])
 
-            # 1. News Signal Priority
+            # 1. News Signal
             news_active, ev = is_news_window(symbol)
             if news_active and flow != "NEUTRAL":
                 execute_unified_trade(symbol, flow, df.iloc[-1]['close'], atr, nav, f"NEWS ({ev['title']})")
                 return
 
-            # 2. APEX Technical Signal
+            # 2. Technical Signal
             r_h1 = instruments.InstrumentsCandles(symbol, {"granularity": "H1", "count": 20})
             client.request(r_h1)
             h1_closes = [float(c["mid"]["c"]) for c in r_h1.response["candles"]]
@@ -166,26 +158,25 @@ def run_apex_unified(symbol, index):
 
 # ==================== SCHEDULER & APP ====================
 scheduler = BackgroundScheduler(timezone="UTC")
-scheduler.add_job(func=scrape_high_impact_news, trigger="interval", minutes=60)
-scheduler.add_job(func=send_daily_summary, trigger="cron", hour=17, minute=0)
+scheduler.add_job(scrape_high_impact_news, "interval", minutes=60)
+scheduler.add_job(send_daily_summary, "cron", hour=21, minute=0)
+scheduler.add_job(bot_heartbeat, "interval", hours=4)
 scheduler.start()
 
 @app.route('/run')
 def trigger():
-    def run_cycle():
-        for i, s in enumerate(SYMBOLS):
-            run_apex_unified(s, i)
-            time.sleep(15) 
+    def background_worker():
+        for s in SYMBOLS:
+            run_apex_unified(s)
+            time.sleep(5) # Reduced sleep to finish cycle faster
 
-    threading.Thread(target=run_cycle).start()
-    return jsonify({"status": "Engine Running", "trailing_stop": "Enabled"}), 200
+    threading.Thread(target=background_worker).start()
+    return jsonify({"status": "APEX-V10 Cycle Started", "time": str(datetime.now())}), 200
 
 @app.route('/')
 def home():
-    return "APEX-V10 LIVE (Trailing Stop Active)", 200
+    return "APEX-V10 LIVE", 200
 
 if __name__ == "__main__":
     scrape_high_impact_news()
-    r = accounts.AccountSummary(OANDA_ACCOUNT_ID); client.request(r)
-    SESSION_START_NAV = float(r.response["account"]["NAV"])
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
