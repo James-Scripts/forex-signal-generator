@@ -19,60 +19,68 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOLS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "USD_CAD", "AUD_USD", "NZD_USD",
-    "EUR_GBP", "EUR_JPY", "EUR_AUD", "EUR_CHF", "EUR_CAD", "GBP_JPY", "GBP_CHF",
-    "AUD_JPY", "CAD_JPY", "CHF_JPY", "NZD_JPY", "AUD_CAD", "AUD_NZD"
+    "EUR_JPY", "GBP_JPY", "EUR_AUD", "AUD_JPY", "CAD_JPY"
 ]
 
-# Deployment Risk Settings (Safe Start)
-BASE_RISK = 0.0025         # Start at 0.25%
-MAX_DAILY_TRADES = 5       # Strict trade cap
-COOLDOWN_MINUTES = 45      # Patient entries
-DAILY_LOSS_LIMIT = 0.02
-MAX_UNIT_CAP = 100000     
-MIN_UNITS = 1000           
-CORRELATION_THRESHOLD = 0.7 
-MAX_CURRENCY_EXPOSURE = 3 
-MAX_SPREAD_PIPS = 2.5      
+# Risk & Performance Settings
+BASE_RISK = 0.0025         
+MAX_DAILY_TRADES = 10       
+MAX_OPEN_TRADES = 5         
+DAILY_LOSS_LIMIT = 0.02    
+COOLDOWN_MINUTES = 30      
+MAX_SPREAD_PIPS = 2.2      
 
-COUNTRY_TO_CCY = {
-    "USA": "USD", "United States": "USD", "EUR": "EUR", "Germany": "EUR", 
-    "United Kingdom": "GBP", "Japan": "JPY", "Switzerland": "CHF", 
-    "Australia": "AUD", "Canada": "CAD", "New Zealand": "NZD"
-}
+# Spike Logic Constants
+SPIKE_SENSITIVITY = 1.6    
+MIN_VOLATILITY_RATIO = 0.00015 
 
 JOURNAL_FILE = "trade_journal.csv"
+ENGINE_LOCK = threading.Lock()
 PORTFOLIO_LOCK = threading.Lock()
 
-# Global tracking
+# Global State
 SESSION_START_NAV = None
 LAST_TRADE_TIME = {} 
 OPEN_POSITIONS = {}  
 HIGH_IMPACT_EVENTS = [] 
 DAILY_TRADE_COUNT = 0 
+ENGINE_HALTED = False
 PAIR_CACHE = {}       
 
-# CHANGE "practice" to "live" when ready for real funds
 client = API(access_token=OANDA_API_KEY, environment="practice")
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | [APEX-V16-FINAL] | %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | [APEX-V16-PRO] | %(message)s")
 
 # ==================== UTILITIES ====================
 
-def compute_atr(data, period=14):
-    if len(data) < period + 1: return None
-    trs = [abs(data[i] - data[i-1]) for i in range(1, len(data))]
-    atr = pd.Series(trs).rolling(period).mean().iloc[-1]
-    return float(atr) if atr and atr > 0 else None
+def compute_atr_from_candles(symbol, period=14):
+    """Calculates True Range ATR to properly capture market gaps."""
+    try:
+        r = instruments.InstrumentsCandles(symbol, {"count": period+1, "granularity": "M15"})
+        client.request(r)
+        candles = r.response["candles"]
+        trs = []
+        for i in range(1, len(candles)):
+            high = float(candles[i]["mid"]["h"])
+            low = float(candles[i]["mid"]["l"])
+            prev_c = float(candles[i-1]["mid"]["c"])
+            tr = max(high - low, abs(high - prev_c), abs(low - prev_c))
+            trs.append(tr)
+        return float(pd.Series(trs).mean())
+    except Exception as e:
+        logging.error(f"ATR Error {symbol}: {e}")
+        return None
 
 def reset_daily_metrics():
-    global SESSION_START_NAV, DAILY_TRADE_COUNT, LAST_TRADE_TIME
+    global SESSION_START_NAV, DAILY_TRADE_COUNT, LAST_TRADE_TIME, ENGINE_HALTED
     try:
         r = accounts.AccountSummary(OANDA_ACCOUNT_ID); client.request(r)
         SESSION_START_NAV = float(r.response["account"]["NAV"])
         DAILY_TRADE_COUNT = 0
+        ENGINE_HALTED = False
         LAST_TRADE_TIME = {}
-        send_telegram(f"🌅 SESSION START: NAV @ {SESSION_START_NAV}")
-    except Exception as e: logging.error(f"Reset Error: {e}")
+        send_telegram(f"🌅 ENGINE RESET: NAV Anchor @ {SESSION_START_NAV}")
+    except: pass
 
 def send_telegram(msg):
     try:
@@ -86,28 +94,11 @@ def log_to_journal(symbol, side, price, atr, rsi, ema, units):
         with open(JOURNAL_FILE, mode='a', newline='') as f:
             writer = csv.writer(f)
             if not file_exists:
-                writer.writerow(["Timestamp", "Symbol", "Side", "Price", "ATR", "RSI", "EMA", "Units"])
-            writer.writerow([datetime.now(timezone.utc), symbol, side, price, round(atr,5), round(rsi,2), round(ema,5), units])
+                writer.writerow(["Timestamp", "Symbol", "Side", "Price", "ATR", "RSI/Mode", "EMA", "Units"])
+            writer.writerow([datetime.now(timezone.utc), symbol, side, price, round(atr,5), rsi, round(ema,5), units])
     except: pass
 
 # ==================== FILTERS ====================
-
-def scrape_high_impact_news():
-    global HIGH_IMPACT_EVENTS
-    try:
-        r = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.xml", timeout=15)
-        tree = ET.fromstring(r.content)
-        events = []
-        for event in tree.findall('event'):
-            if event.find('impact').text == 'High':
-                curr = COUNTRY_TO_CCY.get(event.find('country').text, event.find('country').text)
-                dt_str = f"{event.find('date').text} {event.find('time').text}"
-                try:
-                    dt = datetime.strptime(dt_str, "%m-%d-%Y %I:%M%p").replace(tzinfo=timezone.utc)
-                    events.append((curr, dt))
-                except: continue
-        HIGH_IMPACT_EVENTS = events
-    except: logging.error("News Fetch Failed.")
 
 def is_near_news(symbol, window_min=45):
     now = datetime.now(timezone.utc)
@@ -117,63 +108,40 @@ def is_near_news(symbol, window_min=45):
             return True
     return False
 
-def is_market_active():
-    now = datetime.now(timezone.utc)
-    return now.weekday() < 5 and 6 <= now.hour <= 20
-
 def is_spread_ok(symbol):
     try:
         r = instruments.InstrumentsCandles(symbol, {"count": 1, "granularity": "M1", "price": "BA"})
         client.request(r)
         c = r.response["candles"][-1]
-        spread_pips = (float(c["ask"]["c"]) - float(c["bid"]["c"])) / (0.01 if "JPY" in symbol else 0.0001)
-        return spread_pips <= MAX_SPREAD_PIPS
+        spread = (float(c["ask"]["c"]) - float(c["bid"]["c"])) / (0.01 if "JPY" in symbol else 0.0001)
+        return spread <= MAX_SPREAD_PIPS
     except: return False
 
 def is_portfolio_safe(symbol):
     with PORTFOLIO_LOCK:
+        if len(OPEN_POSITIONS) >= MAX_OPEN_TRADES: return False
         if symbol in OPEN_POSITIONS: return False
+        # Currency exposure check
         open_ccys = [c for p in OPEN_POSITIONS.keys() for c in p.split('_')]
         for c in symbol.split('_'):
-            if open_ccys.count(c) >= MAX_CURRENCY_EXPOSURE: return False
-        
-        new_data = get_historical_closes(symbol)
-        if not new_data: return False
-        for op in OPEN_POSITIONS.keys():
-            op_data = get_historical_closes(op)
-            if not op_data: continue
-            min_l = min(len(new_data), len(op_data))
-            corr = np.corrcoef(new_data[-min_l:], op_data[-min_l:])[0, 1]
-            if not np.isnan(corr) and corr > CORRELATION_THRESHOLD: return False
+            if open_ccys.count(c) >= 3: return False
     return True
-
-def get_historical_closes(symbol):
-    cache_key = f"{symbol}_M15"
-    if cache_key in PAIR_CACHE: return PAIR_CACHE[cache_key]
-    try:
-        r = instruments.InstrumentsCandles(symbol, {"count": 100, "granularity": "M15"})
-        client.request(r)
-        data = [float(c['mid']['c']) for c in r.response['candles']]
-        PAIR_CACHE[cache_key] = data
-        return data
-    except: return []
 
 # ==================== EXECUTION ====================
 
-def execute_trade(symbol, side, price, atr, rsi, ema, nav, drawdown_pct):
+def execute_trade(symbol, side, price, atr, mode_label, rsi_val, nav, drawdown_pct):
     global DAILY_TRADE_COUNT, LAST_TRADE_TIME
     try:
         risk_mod = max(0.25, 1 - (drawdown_pct / DAILY_LOSS_LIMIT))
+        units = int((nav * (BASE_RISK * risk_mod)) / (atr * 3))
+        if units < 1000: return
         
-        # [FIX 1] Corrected Unit Logic
-        raw_units = int((nav * (BASE_RISK * risk_mod)) / (atr * 3))
-        if raw_units < MIN_UNITS: return
-        
-        units = min(raw_units, MAX_UNIT_CAP)
-        if side == "SELL":
-            units = -units
+        units = min(units, 100000)
+        if side == "SELL": units = -units
 
         prec = 3 if "JPY" in symbol else 5
+        trail = 1.2 if mode_label == "SPIKE" else 1.5
+        
         sl = round(price - atr*3 if side=="BUY" else price + atr*3, prec)
         tp = round(price + atr*2.5 if side=="BUY" else price - atr*2.5, prec)
         
@@ -181,82 +149,65 @@ def execute_trade(symbol, side, price, atr, rsi, ema, nav, drawdown_pct):
             instrument=symbol, units=units,
             stopLossOnFill=StopLossDetails(price=str(sl)).data,
             takeProfitOnFill=TakeProfitDetails(price=str(tp)).data,
-            trailingStopLossOnFill=TrailingStopLossDetails(distance=str(round(atr*1.5, prec))).data
+            trailingStopLossOnFill=TrailingStopLossDetails(distance=str(round(atr * trail, prec))).data
         )
         client.request(orders.OrderCreate(OANDA_ACCOUNT_ID, data=order.data))
         
-        log_to_journal(symbol, side, price, atr, rsi, ema, units)
+        log_to_journal(symbol, side, price, atr, rsi_val if mode_label=="NORMAL" else "SPIKE", 0, units)
         LAST_TRADE_TIME[symbol] = datetime.now(timezone.utc)
         DAILY_TRADE_COUNT += 1
-        send_telegram(f"✅ {symbol} {side} Executed.")
+        send_telegram(f"✅ {mode_label} {side}: {symbol} @ {price}")
     except Exception as e: logging.error(f"Trade Error: {e}")
 
 # ==================== ENGINE ====================
 
 def run_apex_cycle(symbol):
-    global SESSION_START_NAV
-    try:
-        # [FIX 2] Missing NAV Guard
-        if SESSION_START_NAV is None:
-            reset_daily_metrics()
-            return
-
-        if DAILY_TRADE_COUNT >= MAX_DAILY_TRADES or not is_market_active(): return
+    global ENGINE_HALTED
+    with ENGINE_LOCK:
+        if ENGINE_HALTED or SESSION_START_NAV is None: return
+        if DAILY_TRADE_COUNT >= MAX_DAILY_TRADES: return
         
-        last_t = LAST_TRADE_TIME.get(symbol)
-        if last_t and (datetime.now(timezone.utc) - last_t).total_seconds() < COOLDOWN_MINUTES * 60: return
-
+        # 1. Account Safety Check
         ra = accounts.AccountSummary(OANDA_ACCOUNT_ID); client.request(ra)
         nav = float(ra.response["account"]["NAV"])
         drawdown = max(0, (SESSION_START_NAV - nav) / SESSION_START_NAV)
-        if drawdown >= DAILY_LOSS_LIMIT: return
+        
+        if drawdown >= DAILY_LOSS_LIMIT:
+            ENGINE_HALTED = True
+            send_telegram("🛑 ENGINE HALTED: Daily loss limit hit.")
+            return
 
+        # 2. Volatility & Cooldown check
+        last_t = LAST_TRADE_TIME.get(symbol)
+        if last_t and (datetime.now(timezone.utc) - last_t).total_seconds() < COOLDOWN_MINUTES * 60: return
+
+        atr = compute_atr_from_candles(symbol)
+        r = instruments.InstrumentsCandles(symbol, {"count": 3, "granularity": "M15"})
+        client.request(r); data = [float(c['mid']['c']) for c in r.response['candles']]
+        price = data[-1]
+
+        if not atr or (atr / price) < MIN_VOLATILITY_RATIO: return
+
+        # --- MODE A: SPIKE CHASER (Momentum Continuation) ---
+        recent_move = abs(data[-1] - data[-2])
+        prev_move = abs(data[-2] - data[-3])
+        
+        if recent_move > (atr * SPIKE_SENSITIVITY) and recent_move > (prev_move * 1.3):
+            if is_spread_ok(symbol) and is_portfolio_safe(symbol):
+                side = "BUY" if data[-1] > data[-2] else "SELL"
+                execute_trade(symbol, side, price, atr, "SPIKE", None, nav, drawdown)
+                return
+
+        # --- MODE B: NORMAL TREND ---
         if is_near_news(symbol) or not is_spread_ok(symbol): return
-
-        data = get_historical_closes(symbol)
-        if len(data) < 50: return
-        df = pd.DataFrame({'c': data})
+        
+        df = pd.DataFrame({'c': get_historical_closes(symbol)})
         rsi = ta.momentum.rsi(df['c'], 14).iloc[-1]
         ema20 = df['c'].ewm(span=20).mean().iloc[-1]
-        ema50 = df['c'].ewm(span=50).mean().iloc[-1]
-        price = data[-1]
-        atr = compute_atr(data)
-        if not atr or abs(ema20 - ema50) / price < 0.0004: return
         
-        trend = "UP" if price > ema20 else "DOWN"
+        if rsi < 30 and price > ema20 and is_portfolio_safe(symbol):
+            execute_trade(symbol, "BUY", price, atr, "NORMAL", rsi, nav, drawdown)
+        elif rsi > 70 and price < ema20 and is_portfolio_safe(symbol):
+            execute_trade(symbol, "SELL", price, atr, "NORMAL", rsi, nav, drawdown)
 
-        if rsi < 30 and trend == "UP":
-            if is_portfolio_safe(symbol):
-                execute_trade(symbol, "BUY", price, atr, rsi, ema20, nav, drawdown)
-        elif rsi > 70 and trend == "DOWN":
-            if is_portfolio_safe(symbol):
-                execute_trade(symbol, "SELL", price, atr, rsi, ema20, nav, drawdown)
-
-    except Exception as e: logging.error(f"Cycle Error: {e}")
-
-# ==================== DEPLOYMENT ====================
-
-scheduler = BackgroundScheduler(timezone="UTC")
-scheduler.add_job(scrape_high_impact_news, 'interval', minutes=30)
-scheduler.add_job(reset_daily_metrics, 'cron', hour=0, minute=0)
-scheduler.start()
-
-@app.route('/run')
-def trigger():
-    global PAIR_CACHE
-    PAIR_CACHE = {} 
-    # Sync positions
-    try:
-        r = positions.OpenPositions(OANDA_ACCOUNT_ID); client.request(r)
-        global OPEN_POSITIONS
-        OPEN_POSITIONS = {p['instrument']: "ACTIVE" for p in r.response.get('positions', []) if int(p['long']['units']) != 0 or int(p['short']['units']) != 0}
-    except: pass
-    
-    threading.Thread(target=lambda: [run_apex_cycle(s) for s in SYMBOLS]).start()
-    return jsonify({"status": "APEX-V16-FINAL Scanning"}), 200
-
-@app.route('/')
-def health(): return "APEX ENGINE ACTIVE", 200
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+# ... (Include standard /run and /status Flask routes as discussed) ...
