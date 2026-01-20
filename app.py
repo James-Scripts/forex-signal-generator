@@ -156,6 +156,14 @@ def execute_trade(symbol, side, price, atr, mode_label, nav, drawdown_pct):
 
 def run_apex_cycle(symbol):
     global ENGINE_HALTED, SESSION_START_NAV
+
+
+    if SESSION_START_NAV is None:
+        logging.info("NAV anchor missing. Attempting emergency initialization...")
+        reset_daily_metrics()
+        if SESSION_START_NAV is None:
+            logging.error("OANDA Connection Failed. Cannot initialize NAV.")
+            return
     
     # Pre-Lock Check (Visual confirmation in logs)
     logging.info(f"--- 🔎 Scanning {symbol} ---")
@@ -251,8 +259,15 @@ def trigger():
     threading.Thread(target=lambda: [run_apex_cycle(s) for s in SYMBOLS]).start()
     return "Scanning Symbols...", 200
 
+
+
 if __name__ == "__main__":
-    # Initialize data before starting the server
-    reset_daily_metrics()
+    # 1. Force immediate data load
+    logging.info("Initializing APEX-ELITE State...")
+    reset_daily_metrics() # This sets the SESSION_START_NAV
     scrape_high_impact_news()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    
+    # 2. Start the web server
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
