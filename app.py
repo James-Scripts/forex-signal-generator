@@ -152,44 +152,82 @@ def execute_trade(symbol, side, price, atr, mode_label, nav, drawdown_pct):
 
 # ==================== ENGINE CYCLE ====================
 
+
+
 def run_apex_cycle(symbol):
     global ENGINE_HALTED, SESSION_START_NAV
-    if ENGINE_HALTED or SESSION_START_NAV is None: return
     
+    # Pre-Lock Check (Visual confirmation in logs)
+    logging.info(f"--- 🔎 Scanning {symbol} ---")
+    
+    if ENGINE_HALTED:
+        logging.warning(f"Aborted {symbol}: Engine is currently HALTED by Global Kill-Switch.")
+        return
+
+    if SESSION_START_NAV is None:
+        logging.error(f"Aborted {symbol}: Session Start NAV not set. Check connection.")
+        return
+
     with ENGINE_LOCK:
         try:
+            # 1. ACCOUNT HEALTH CHECK
             ra = accounts.AccountSummary(OANDA_ACCOUNT_ID); client.request(ra)
             nav = float(ra.response["account"]["NAV"])
             drawdown = max(0, (SESSION_START_NAV - nav) / SESSION_START_NAV)
             
             if drawdown >= DAILY_LOSS_LIMIT:
                 ENGINE_HALTED = True
-                send_telegram("🛑 KILL-SWITCH ACTIVATED. Engine Halted.")
+                send_telegram(f"🛑 KILL-SWITCH ACTIVATED. Drawdown at {round(drawdown*100, 2)}%. Engine Halted.")
                 return
 
-            if get_open_positions_count() >= MAX_OPEN_TRADES: return
+            # 2. CAPACITY CHECK
+            open_count = get_open_positions_count()
+            if open_count >= MAX_OPEN_TRADES:
+                logging.info(f"[{symbol}] Max open trades reached ({open_count}). Skipping.")
+                return
             
+            # 3. TECHNICAL DATA FETCH
             atr = compute_atr_true_range(symbol)
             r = instruments.InstrumentsCandles(symbol, {"count": 20, "granularity": "M15"})
-            client.request(r); data = [float(c['mid']['c']) for c in r.response['candles']]
+            client.request(r)
+            data = [float(c['mid']['c']) for c in r.response['candles']]
             price = data[-1]
-            if not atr: return
 
-            # 1. HUNTER (Friend's News Strategy)
+            if not atr:
+                logging.warning(f"[{symbol}] Could not calculate ATR. Skipping.")
+                return
+
+            # 4. GEAR 1: HUNTER (The Friend's Strategy)
             h_side = get_hunter_signal(symbol)
             if h_side:
+                logging.info(f"🎯 HUNTER SIGNAL DETECTED: {symbol} {h_side}!")
                 execute_trade(symbol, h_side, price, atr, "HUNTER", nav, drawdown)
                 return
+            else:
+                logging.info(f"[{symbol}] News Hunter: No pending high-impact events in window.")
 
-            # 2. SPIKE
-            if abs(data[-1] - data[-2]) > (atr * SPIKE_SENSITIVITY):
-                execute_trade(symbol, "BUY" if data[-1] > data[-2] else "SELL", price, atr, "SPIKE", nav, drawdown)
+            # 5. GEAR 2: SPIKE (Reactionary Momentum)
+            move = abs(data[-1] - data[-2])
+            threshold = atr * SPIKE_SENSITIVITY
+            if move > threshold:
+                side = "BUY" if data[-1] > data[-2] else "SELL"
+                logging.info(f"⚡ SPIKE DETECTED: {symbol} {side} (Move: {round(move,5)} > Threshold: {round(threshold,5)})")
+                execute_trade(symbol, side, price, atr, "SPIKE", nav, drawdown)
                 return
-            
-            # 3. NORMAL (Simplified RSI check)
-            # Add your RSI/EMA logic here if desired
+            else:
+                logging.info(f"[{symbol}] Volatility: Move {round(move,5)} < Threshold {round(threshold,5)}")
 
-        except Exception as e: logging.error(f"Cycle Error {symbol}: {e}")
+            # 6. GEAR 3: NORMAL (Optional RSI/EMA)
+            # logging.info(f"[{symbol}] Quiet market. No valid technical signals found.")
+
+        except Exception as e:
+            logging.error(f"Cycle Error {symbol}: {e}")
+
+
+
+
+
+
 
 # ==================== SERVER & SCHEDULER ====================
 
