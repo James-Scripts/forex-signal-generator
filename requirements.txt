@@ -1,13 +1,20 @@
+# Web & Server
 Flask==3.0.0
 gunicorn==21.2.0
-apscheduler
+python-dotenv==1.0.1
+
+# Trading & API
 oandapyV20==0.7.2
+requests==2.32.3
+
+# Data Analysis
 pandas==2.2.2
 numpy==1.26.4
 ta==0.11.0
-requests==2.32.3
-textblob==0.18.0.post0
-python-dotenv==1.0.1
-openai>=1.55.3
+
+# Scheduling & News
+apscheduler==3.10.4
 feedparser==6.0.11
-bayesian-optimization==1.5.0
+
+# Processing (Keep if you use TextBlob for news sentiment)
+textblob==0.18.0.post0
