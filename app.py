@@ -196,7 +196,8 @@ def run_apex_cycle(symbol):
             
             # 3. TECHNICAL DATA FETCH
             atr = compute_atr_true_range(symbol)
-            r = instruments.InstrumentsCandles(symbol, {"count": 20, "granularity": "M15"})
+            r = instruments.InstrumentsCandles(symbol, {"count": 20, "granularity": "M5"})
+           
             client.request(r)
             data = [float(c['mid']['c']) for c in r.response['candles']]
             price = data[-1]
