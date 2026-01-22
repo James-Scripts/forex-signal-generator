@@ -20,16 +20,17 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOLS = ["EUR_USD","GBP_USD","USD_JPY","USD_CHF","USD_CAD","AUD_USD","NZD_USD","EUR_JPY","GBP_JPY"]
 
 # Risk & Performance
-BASE_RISK = 0.0025
-MAX_DAILY_TRADES = 12
+BASE_RISK = 0.0030  # Slightly increased to help "put food on the table"
+MAX_DAILY_TRADES = 20
 MAX_OPEN_TRADES = 5
-DAILY_LOSS_LIMIT = 0.02
-COOLDOWN_MINUTES = 20
+DAILY_LOSS_LIMIT = 0.025
+COOLDOWN_MINUTES = 15
 MAX_SPREAD_PIPS = 2.5
 
-# Spike / News Hunter
-SPIKE_SENSITIVITY = 1.6
-HUNTER_WINDOW_SECONDS = 60
+# Engine Tuning (Loosened for more frequency)
+SPIKE_SENSITIVITY = 0.9      # Was 1.6 (Will catch many more momentum moves)
+HUNTER_WINDOW_SECONDS = 300  # Was 60s (5-minute window for news moves)
+EMA_FILTER_PERIOD = 200      # The "Bodyguard" trend line
 
 JOURNAL_FILE = "trade_journal.csv"
 ENGINE_LOCK = threading.Lock()
@@ -43,23 +44,40 @@ HIGH_IMPACT_EVENTS = []
 
 client = API(access_token=OANDA_API_KEY, environment="practice")
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | [APEX-ELITE] | %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | [APEX-SURVIVOR] | %(message)s")
 
 # ==================== UTILITIES ====================
 
-def compute_atr_true_range(symbol, period=14):
+def compute_indicators(symbol):
     try:
-        r = instruments.InstrumentsCandles(symbol, {"count": period+1, "granularity": "M15"})
+        # Fetch 250 candles to ensure enough data for 200 EMA and RSI
+        r = instruments.InstrumentsCandles(symbol, {"count": 250, "granularity": "M5"})
         client.request(r)
         candles = r.response["candles"]
+        prices = pd.Series([float(c['mid']['c']) for c in candles])
+        
+        # 1. EMA Bodyguard
+        ema = prices.ewm(span=EMA_FILTER_PERIOD).mean().iloc[-1]
+        
+        # 2. RSI (14)
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs.iloc[-1]))
+        
+        # 3. ATR (14)
         trs = []
-        for i in range(1, len(candles)):
-            h = float(candles[i]["mid"]["h"])
-            l = float(candles[i]["mid"]["l"])
+        for i in range(len(candles)-14, len(candles)):
+            h, l = float(candles[i]["mid"]["h"]), float(candles[i]["mid"]["l"])
             pc = float(candles[i-1]["mid"]["c"])
             trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-        return float(pd.Series(trs).mean())
-    except: return None
+        atr = float(pd.Series(trs).mean())
+        
+        return ema, rsi, atr
+    except Exception as e:
+        logging.error(f"Indicator Error {symbol}: {e}")
+        return None, None, None
 
 def reset_daily_metrics():
     global SESSION_START_NAV, DAILY_TRADE_COUNT, LAST_TRADE_TIME, ENGINE_HALTED
@@ -126,21 +144,24 @@ def get_open_positions_count():
 
 def execute_trade(symbol, side, price, atr, mode_label, nav, drawdown_pct):
     global DAILY_TRADE_COUNT, LAST_TRADE_TIME
+    # Cooldown Check
+    if symbol in LAST_TRADE_TIME:
+        elapsed = (datetime.now(timezone.utc) - LAST_TRADE_TIME[symbol]).total_seconds() / 60
+        if elapsed < COOLDOWN_MINUTES: return
+
     try:
         risk_mod = max(0.25, 1 - (drawdown_pct / DAILY_LOSS_LIMIT))
         units = int((nav * (BASE_RISK * risk_mod)) / (atr * 3))
-        if units < 1000: return
-        units = min(units, 100000)
-        if side == "SELL": units = -units
+        if units < 100: return # Micro-lot safety
         
+        if side == "SELL": units = -units
         prec = 3 if "JPY" in symbol else 5
-        trail_dist = 1.1 if mode_label in ["SPIKE", "HUNTER"] else 1.5
         
         order = MarketOrderRequest(
             instrument=symbol, units=units,
             stopLossOnFill=StopLossDetails(price=str(round(price - atr*3 if side=="BUY" else price + atr*3, prec))).data,
             takeProfitOnFill=TakeProfitDetails(price=str(round(price + (atr*4 if mode_label=="HUNTER" else atr*2.5) if side=="BUY" else price - (atr*4 if mode_label=="HUNTER" else atr*2.5), prec))).data,
-            trailingStopLossOnFill=TrailingStopLossDetails(distance=str(round(atr * trail_dist, prec))).data
+            trailingStopLossOnFill=TrailingStopLossDetails(distance=str(round(atr * 1.2, prec))).data
         )
         client.request(orders.OrderCreate(OANDA_ACCOUNT_ID, data=order.data))
         
@@ -152,91 +173,56 @@ def execute_trade(symbol, side, price, atr, mode_label, nav, drawdown_pct):
 
 # ==================== ENGINE CYCLE ====================
 
-
-
 def run_apex_cycle(symbol):
     global ENGINE_HALTED, SESSION_START_NAV
 
-
-    if SESSION_START_NAV is None:
-        logging.info("NAV anchor missing. Attempting emergency initialization...")
-        reset_daily_metrics()
-        if SESSION_START_NAV is None:
-            logging.error("OANDA Connection Failed. Cannot initialize NAV.")
-            return
-    
-    # Pre-Lock Check (Visual confirmation in logs)
-    logging.info(f"--- 🔎 Scanning {symbol} ---")
-    
-    if ENGINE_HALTED:
-        logging.warning(f"Aborted {symbol}: Engine is currently HALTED by Global Kill-Switch.")
-        return
-
-    if SESSION_START_NAV is None:
-        logging.error(f"Aborted {symbol}: Session Start NAV not set. Check connection.")
-        return
+    if ENGINE_HALTED or SESSION_START_NAV is None: return
 
     with ENGINE_LOCK:
         try:
-            # 1. ACCOUNT HEALTH CHECK
+            # 1. Health & NAV Check
             ra = accounts.AccountSummary(OANDA_ACCOUNT_ID); client.request(ra)
             nav = float(ra.response["account"]["NAV"])
             drawdown = max(0, (SESSION_START_NAV - nav) / SESSION_START_NAV)
             
             if drawdown >= DAILY_LOSS_LIMIT:
                 ENGINE_HALTED = True
-                send_telegram(f"🛑 KILL-SWITCH ACTIVATED. Drawdown at {round(drawdown*100, 2)}%. Engine Halted.")
+                send_telegram("🛑 KILL-SWITCH: Daily Loss Limit Reached.")
                 return
 
-            # 2. CAPACITY CHECK
-            open_count = get_open_positions_count()
-            if open_count >= MAX_OPEN_TRADES:
-                logging.info(f"[{symbol}] Max open trades reached ({open_count}). Skipping.")
-                return
-            
-            # 3. TECHNICAL DATA FETCH
-            atr = compute_atr_true_range(symbol)
-            r = instruments.InstrumentsCandles(symbol, {"count": 20, "granularity": "M5"})
-           
-            client.request(r)
-            data = [float(c['mid']['c']) for c in r.response['candles']]
+            if get_open_positions_count() >= MAX_OPEN_TRADES: return
+
+            # 2. Indicators Fetch (Bodyguard logic)
+            ema, rsi, atr = compute_indicators(symbol)
+            if not ema or not atr: return
+
+            r = instruments.InstrumentsCandles(symbol, {"count": 5, "granularity": "M5"})
+            client.request(r); data = [float(c['mid']['c']) for c in r.response['candles']]
             price = data[-1]
+            trend = "UP" if price > ema else "DOWN"
 
-            if not atr:
-                logging.warning(f"[{symbol}] Could not calculate ATR. Skipping.")
-                return
-
-            # 4. GEAR 1: HUNTER (The Friend's Strategy)
+            # 3. GEAR 1: HUNTER (News Window)
             h_side = get_hunter_signal(symbol)
-            if h_side:
-                logging.info(f"🎯 HUNTER SIGNAL DETECTED: {symbol} {h_side}!")
+            if h_side and h_side == ("BUY" if trend == "UP" else "SELL"):
                 execute_trade(symbol, h_side, price, atr, "HUNTER", nav, drawdown)
                 return
-            else:
-                logging.info(f"[{symbol}] News Hunter: No pending high-impact events in window.")
 
-            # 5. GEAR 2: SPIKE (Reactionary Momentum)
-            move = abs(data[-1] - data[-2])
-            threshold = atr * SPIKE_SENSITIVITY
-            if move > threshold:
-                side = "BUY" if data[-1] > data[-2] else "SELL"
-                logging.info(f"⚡ SPIKE DETECTED: {symbol} {side} (Move: {round(move,5)} > Threshold: {round(threshold,5)})")
-                execute_trade(symbol, side, price, atr, "SPIKE", nav, drawdown)
-                return
-            else:
-                logging.info(f"[{symbol}] Volatility: Move {round(move,5)} < Threshold {round(threshold,5)}")
+            # 4. GEAR 2: SPIKE (Momentum with Bodyguard)
+            move = data[-1] - data[-2]
+            if abs(move) > (atr * SPIKE_SENSITIVITY):
+                side = "BUY" if move > 0 else "SELL"
+                if side == ("BUY" if trend == "UP" else "SELL"): # Only follow the 200 EMA
+                    execute_trade(symbol, side, price, atr, "SPIKE", nav, drawdown)
+                    return
 
-            # 6. GEAR 3: NORMAL (Optional RSI/EMA)
-            # logging.info(f"[{symbol}] Quiet market. No valid technical signals found.")
+            # 5. GEAR 3: FLOW (The Survival Mode - Catching the trend)
+            # If market is trending up and RSI is strong but not overbought
+            if trend == "UP" and 55 < rsi < 75:
+                execute_trade(symbol, "BUY", price, atr, "FLOW", nav, drawdown)
+            elif trend == "DOWN" and 25 < rsi < 45:
+                execute_trade(symbol, "SELL", price, atr, "FLOW", nav, drawdown)
 
-        except Exception as e:
-            logging.error(f"Cycle Error {symbol}: {e}")
-
-
-
-
-
-
+        except Exception as e: logging.error(f"Cycle Error {symbol}: {e}")
 
 # ==================== SERVER & SCHEDULER ====================
 
@@ -245,30 +231,17 @@ scheduler.add_job(scrape_high_impact_news, 'interval', minutes=30)
 scheduler.add_job(reset_daily_metrics, 'cron', hour=0, minute=0)
 scheduler.start()
 
-@app.route('/status')
-def status():
-    return jsonify({
-        "engine": "APEX-ELITE", 
-        "halted": ENGINE_HALTED, 
-        "trades": DAILY_TRADE_COUNT, 
-        "nav": SESSION_START_NAV,
-        "news_events": len(HIGH_IMPACT_EVENTS)
-    }), 200
+@app.route('/')
+def home():
+    return jsonify({"status": "APEX-SURVIVOR ONLINE", "trades_today": DAILY_TRADE_COUNT})
 
 @app.route('/run')
 def trigger():
     threading.Thread(target=lambda: [run_apex_cycle(s) for s in SYMBOLS]).start()
-    return "Scanning Symbols...", 200
-
-
+    return "Scan Initiated...", 200
 
 if __name__ == "__main__":
-    # 1. Force immediate data load
-    logging.info("Initializing APEX-ELITE State...")
-    reset_daily_metrics() # This sets the SESSION_START_NAV
+    reset_daily_metrics()
     scrape_high_impact_news()
-    
-    # 2. Start the web server
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-
