@@ -1,20 +1,20 @@
-# Web & Server
-Flask==3.0.0
-gunicorn==21.2.0
+# --- Web & Server ---
+Flask==3.0.3
+gunicorn==22.0.0
 python-dotenv==1.0.1
+asgiref==3.8.1
 
-# Trading & API
+# --- Trading & API ---
 oandapyV20==0.7.2
 requests==2.32.3
+urllib3==2.2.1
 
-# Data Analysis
-pandas==2.2.2
+# --- Math & Data Analysis ---
+# Scipy is mandatory for the Bayesian 'beta' distribution
+scipy==1.13.1
 numpy==1.26.4
-ta==0.11.0
+pandas==2.2.2
 
-# Scheduling & News
+# --- Scheduling & Utilities ---
 apscheduler==3.10.4
-feedparser==6.0.11
-
-# Processing (Keep if you use TextBlob for news sentiment)
-textblob==0.18.0.post0
+lxml==5.2.2
