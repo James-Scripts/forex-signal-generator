@@ -25,7 +25,7 @@ OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 SYMBOLS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD"]
 
 BASE_RISK = 0.003
-DAILY_LOSS_LIMIT = 0.02
+DAILY_LOSS_LIMIT = 0.5
 NEWS_WINDOW = 60
 MIN_COOLDOWN = 300  # Lowered to 5 mins for better activity
 STATS_FILE = "strategy_stats.json"
