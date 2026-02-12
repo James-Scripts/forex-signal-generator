@@ -1,11 +1,21 @@
-import os, time, logging
+import os, time, logging, threading
 import numpy as np
 import pandas as pd
+from flask import Flask, jsonify  # Added Flask
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
 import oandapyV20.endpoints.orders as orders
 import oandapyV20.endpoints.positions as positions
 import oandapyV20.endpoints.accounts as accounts
+
+# =========================
+# WEB SERVER SETUP (REQUIRED FOR RENDER)
+# =========================
+app = Flask(__name__) # Gunicorn looks for this 'app' variable
+
+@app.route('/')
+def health_check():
+    return jsonify({"status": "running", "bot": "Oanda Production Engine"}), 200
 
 # =========================
 # PRODUCTION CONFIG
@@ -15,20 +25,17 @@ OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 OANDA_ENV = "practice" 
 
 INSTRUMENTS = ["EUR_USD", "GBP_USD", "USD_JPY"]
-RISK_PER_TRADE = 0.01  # 1% Account Risk
+RISK_PER_TRADE = 0.01  
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 2.0   # SL distance
-TP_RATIO = 1.5         # 1.5x SL distance
+ATR_MULTIPLIER = 2.0   
+TP_RATIO = 1.5         
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 api = API(access_token=OANDA_API_KEY, environment=OANDA_ENV)
 
-# Dictionary to track the last candle we processed per pair
 last_candle_time = {inst: None for inst in INSTRUMENTS}
 
-# =========================
-# CORE FUNCTIONS
-# =========================
+# ... [Keep your get_account_balance, has_open_position, etc. functions exactly as they were] ...
 
 def get_account_balance():
     r = accounts.AccountSummary(OANDA_ACCOUNT_ID)
@@ -36,11 +43,9 @@ def get_account_balance():
     return float(r.response["account"]["NAV"])
 
 def has_open_position(inst):
-    """Safety: Checks if we already have a trade in this instrument."""
     try:
         r = positions.PositionDetails(OANDA_ACCOUNT_ID, instrument=inst)
         api.request(r)
-        # If long or short units are non-zero, we have a position
         pos = r.response.get("position", {})
         long_units = float(pos.get("long", {}).get("units", 0))
         short_units = float(pos.get("short", {}).get("units", 0))
@@ -49,35 +54,25 @@ def has_open_position(inst):
         return False
 
 def get_advanced_data(inst, tf="M5", count=250):
-    """Fetches OHLC and calculates ATR + EMA Trend Filter."""
     params = {"granularity": tf, "count": count, "price": "M"}
     r = instruments.InstrumentsCandles(instrument=inst, params=params)
     api.request(r)
-    
     df = pd.DataFrame([
         {'time': c['time'], 'o': float(c['mid']['o']), 'h': float(c['mid']['h']), 
          'l': float(c['mid']['l']), 'c': float(c['mid']['c'])} 
         for c in r.response['candles'] if c['complete']
     ])
-    
-    # 1. Calculate True Range
     df['h-l'] = df['h'] - df['l']
     df['h-pc'] = abs(df['h'] - df['c'].shift(1))
     df['l-pc'] = abs(df['l'] - df['c'].shift(1))
     df['tr'] = df[['h-l', 'h-pc', 'l-pc']].max(axis=1)
     df['atr'] = df['tr'].rolling(ATR_PERIOD).mean()
-    
-    # 2. Market Regime Filter (200 EMA)
     df['ema_200'] = df['c'].ewm(span=200, adjust=False).mean()
-    
     return df
 
 def calculate_units(inst, balance, sl_pips, price):
-    """Professional Position Sizing."""
-    # Simplified pip value logic (needs adjustment for JPY pairs)
     pip_val = 0.01 if "JPY" in inst else 0.0001
     risk_amount = balance * RISK_PER_TRADE
-    # Units = Risk / (SL distance in pips * pip value)
     sl_dist_pips = sl_pips / pip_val
     units = risk_amount / (sl_dist_pips * pip_val)
     return int(units)
@@ -88,62 +83,56 @@ def calculate_units(inst, balance, sl_pips, price):
 
 def run_strategy():
     logging.info("--- OANDA PRODUCTION ENGINE ENGAGED ---")
-    
     while True:
-        balance = get_account_balance()
-        
-        for inst in INSTRUMENTS:
-            df = get_advanced_data(inst)
-            if df.empty: continue
-            
-            curr_candle = df.iloc[-1]
-            last_close = curr_candle['c']
-            atr = curr_candle['atr']
-            ema = curr_candle['ema_200']
-            
-            # 1. New Candle Check
-            if last_candle_time[inst] == curr_candle['time']:
-                continue
-            
-            # 2. Position Check
-            if has_open_position(inst):
-                continue
+        try:
+            balance = get_account_balance()
+            for inst in INSTRUMENTS:
+                df = get_advanced_data(inst)
+                if df.empty: continue
+                curr_candle = df.iloc[-1]
+                last_close = curr_candle['c']
+                atr = curr_candle['atr']
+                ema = curr_candle['ema_200']
+                
+                if last_candle_time[inst] == curr_candle['time']: continue
+                if has_open_position(inst): continue
 
-            # 3. Strategy Logic (Price > EMA + Slope)
-            slope = (df['c'].iloc[-1] - df['c'].iloc[-10]) / 10
-            direction = None
-            
-            if last_close > ema and slope > 0:
-                direction = "LONG"
-            elif last_close < ema and slope < 0:
-                direction = "SHORT"
+                slope = (df['c'].iloc[-1] - df['c'].iloc[-10]) / 10
+                direction = None
+                if last_close > ema and slope > 0: direction = "LONG"
+                elif last_close < ema and slope < 0: direction = "SHORT"
                 
-            if direction:
-                # 4. Sizing & Risk
-                sl_dist = atr * ATR_MULTIPLIER
-                units = calculate_units(inst, balance, sl_dist, last_close)
-                
-                sl_price = last_close - sl_dist if direction == "LONG" else last_close + sl_dist
-                tp_price = last_close + (sl_dist * TP_RATIO) if direction == "LONG" else last_close - (sl_dist * TP_RATIO)
-                
-                # 5. Place Order
-                order_data = {
-                    "order": {
-                        "instrument": inst, "units": str(units if direction == "LONG" else -units),
-                        "type": "MARKET", "timeInForce": "GTC",
-                        "stopLossOnFill": {"price": f"{sl_price:.5f}"},
-                        "takeProfitOnFill": {"price": f"{tp_price:.5f}"}
+                if direction:
+                    sl_dist = atr * ATR_MULTIPLIER
+                    units = calculate_units(inst, balance, sl_dist, last_close)
+                    sl_price = last_close - sl_dist if direction == "LONG" else last_close + sl_dist
+                    tp_price = last_close + (sl_dist * TP_RATIO) if direction == "LONG" else last_close - (sl_dist * TP_RATIO)
+                    
+                    order_data = {
+                        "order": {
+                            "instrument": inst, "units": str(units if direction == "LONG" else -units),
+                            "type": "MARKET", "timeInForce": "GTC",
+                            "stopLossOnFill": {"price": f"{sl_price:.5f}"},
+                            "takeProfitOnFill": {"price": f"{tp_price:.5f}"}
+                        }
                     }
-                }
-                try:
                     r = orders.OrderCreate(OANDA_ACCOUNT_ID, data=order_data)
                     api.request(r)
                     logging.info(f"TRADE: {inst} {direction} | Units: {units} | SL: {sl_price:.4f}")
                     last_candle_time[inst] = curr_candle['time']
-                except Exception as e:
-                    logging.error(f"Order Failed: {e}")
+        except Exception as e:
+            logging.error(f"Strategy Error: {e}")
+        time.sleep(15)
 
-        time.sleep(15) # Pulse every 15s, but candle-lock handles frequency
+# =========================
+# STARTUP LOGIC
+# =========================
+
+# This is crucial: We start the bot in a background thread 
+# so it doesn't block the Flask server that Render needs.
+bot_thread = threading.Thread(target=run_strategy, daemon=True)
+bot_thread.start()
 
 if __name__ == "__main__":
-    run_strategy()
+    # Local testing
+    app.run(port=8080)
