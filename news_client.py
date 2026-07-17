@@ -5,17 +5,26 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("NewsClient")
 
+# Curated to major market-moving entities
 AUTHORITY_SOURCES = [
-    "Bureau of Labor Statistics", "Federal Reserve", "Department of Labor",
-    "Census Bureau", "Bureau of Economic Analysis", "Bank of England",
-    "Office for National Statistics", "European Central Bank", "Eurostat",
-    "Deutsche Bundesbank", "Bank of Canada", "Statistics Canada", 
-    "Reserve Bank of Australia", "Australian Bureau of Statistics"
+    "Federal Reserve", "Federal Open Market Committee", "Bureau of Labor Statistics", 
+    "Department of Labor", "Bureau of Economic Analysis", "Census Bureau",
+    "European Central Bank", "Eurostat", "Bank of England", "Office for National Statistics",
+    "Bank of Canada", "Statistics Canada", "Reserve Bank of Australia", "Australian Bureau of Statistics",
+    "Reserve Bank of New Zealand", "Statistics New Zealand", "Bank of Japan", "Ministry of Finance",
+    "Cabinet Office Japan", "Swiss National Bank", "State Secretariat for Economic Affairs"
+]
+
+# Robust macro target checklist 
+AUTHORIZED_KEYWORDS = [
+    "cpi", "core cpi", "ppi", "pce", "core pce", "nonfarm payroll", "nfp", "payroll",
+    "unemployment", "jobless", "retail sales", "gdp", "interest rate", "rate decision",
+    "fomc", "minutes", "powell", "ecb", "lagarde", "boe", "bailey", "manufacturing pmi",
+    "services pmi", "ism", "consumer confidence", "durable goods", "trade balance", "inflation"
 ]
 
 class NewsCalendarClient:
     def __init__(self, api_key: str = None, news_source: str = None):
-        # Retain references to maintain constructor backwards compatibility
         self.api_key = api_key or os.getenv("JBLANKED_API_KEY")
         self.news_source = news_source or os.getenv("NEWS_SOURCE", "forex-factory")
         self.fmp_key = os.getenv("FMP_API_KEY")
@@ -23,8 +32,8 @@ class NewsCalendarClient:
 
     def fetch_high_impact_events(self) -> list:
         """
-        Pivots from JBlanked to Financial Modeling Prep's Economic Calendar API.
-        Extracts high-impact economic indicators for the active calendar date.
+        Fetches high-impact economic indicators from FMP and verifies them 
+        using a dual Authority/Keyword matrix framework.
         """
         if not self.fmp_key:
             logger.error("FMP_API_KEY is missing. Skipping economic calendar aggregation.")
@@ -46,12 +55,10 @@ class NewsCalendarClient:
                 
             vetted_events = []
             for event in response.json():
-                # Filter down strictly to High impact to match risk profile
-                impact = event.get("impact")
-                if impact != "High":
+                # Primary filter: Trust FMP's high impact classification metadata
+                if event.get("impact") != "High":
                     continue
                     
-                # Limit tracking to tradeable target pairs
                 currency = event.get("currency")
                 if currency not in ["USD", "EUR", "GBP"]:
                     continue
@@ -59,15 +66,18 @@ class NewsCalendarClient:
                 name = event.get("event") or ""
                 country = event.get("country") or ""
                 
-                # Check for authority credentials or critical core high-volatility keywords
-                is_authorized = any(src.lower() in name.lower() or src.lower() in country.lower() for src in AUTHORITY_SOURCES)
-                if not is_authorized and any(kw in name.lower() for kw in ["rate", "fomc", "cpi", "nfp", "gdp"]):
-                    is_authorized = True
+                # Broad text matching context evaluation
+                text = f"{name} {country}".lower()
+                
+                # Check for either specific institutional authority OR matching macro indicators
+                is_authorized = (
+                    any(src.lower() in text for src in AUTHORITY_SOURCES) or
+                    any(keyword in text for keyword in AUTHORIZED_KEYWORDS)
+                )
                     
                 if not is_authorized:
                     continue
 
-                # Parse FMP format: "YYYY-MM-DD HH:MM:SS"
                 date_str = event.get("date")
                 try:
                     scheduled_time = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
