@@ -39,7 +39,7 @@ class NewsCalendarClient:
             logger.error("FMP_API_KEY is missing. Skipping economic calendar aggregation.")
             return []
             
-        url = "https://financialmodelingprep.com/stable/economic-calendar"
+        url = "https://financialmodelingprep.com/api/v3/economic_calendar"
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         params = {
             "apikey": self.fmp_key,
