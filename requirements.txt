@@ -1,20 +1,10 @@
-# --- Web & Server ---
-Flask==3.0.3
-gunicorn==22.0.0
-python-dotenv==1.0.1
-asgiref==3.8.1
-
-# --- Trading & API ---
-oandapyV20==0.7.2
-requests==2.32.3
-urllib3==2.2.1
-
-# --- Math & Data Analysis ---
-# Scipy is mandatory for the Bayesian 'beta' distribution
-scipy==1.13.1
-numpy==1.26.4
+supabase==2.5.1
+httpx==0.27.0
 pandas==2.2.2
-
-# --- Scheduling & Utilities ---
-apscheduler==3.10.4
-lxml==5.2.2
+fastapi==0.111.0
+uvicorn==0.30.1
+numpy==1.26.4
+beautifulsoup4==4.12.3
+scikit-learn==1.5.0
+joblib==1.4.2
+lightgbm
