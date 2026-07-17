@@ -30,6 +30,7 @@ class NewsCalendarClient:
         try:
             response = requests.get(self.base_url, headers=headers, timeout=8)
             if response.status_code != 200:
+                logger.error(f"JBlanked API returned status code {response.status_code}")
                 return []
             
             vetted_events = []
@@ -102,7 +103,6 @@ class NewsCalendarClient:
                 if not currency:
                     continue
                     
-                # Look for immediate shock signals
                 sentiment = 0
                 if any(w in full_text for w in ["hike", "hawkish", "bullish", "strong", "growth"]):
                     sentiment = 1
