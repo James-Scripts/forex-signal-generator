@@ -1,10 +1,10 @@
 supabase==2.5.1
 httpx==0.27.0
-pandas==2.2.2
+pandas==2.2.3         # Minimum version for Python 3.13 compatibility
 fastapi==0.111.0
 uvicorn==0.30.1
-numpy==1.26.4
+numpy==2.1.0          # Updated to support Python 3.13
 beautifulsoup4==4.12.3
-scikit-learn==1.5.0
+scikit-learn==1.5.1   # Updated to support Python 3.13
 joblib==1.4.2
 lightgbm
