@@ -139,6 +139,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
+@app.get("/")
+def root_endpoint():
+    """Default landing route to satisfy standard platform health checks"""
+    return {"status": "online", "service": "Forex News Signal Engine"}
+
+
+
 @app.get("/cron")
 @app.get("/health")
 def keep_alive_endpoint():
