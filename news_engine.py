@@ -28,7 +28,7 @@ class NewsStateEngine:
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
         try:
             async with httpx.AsyncClient() as client:
-                await client.post(url, json=payload, timeout=5)
+                await client.post(url, json=payload, timeout=15)
         except Exception as e:
             logger.error(f"Telegram failed: {e}")
 
