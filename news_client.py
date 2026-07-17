@@ -29,47 +29,48 @@ class NewsCalendarClient:
         self.news_source = news_source or os.getenv("NEWS_SOURCE", "forex-factory")
         self.fmp_key = os.getenv("FMP_API_KEY")
         self.newsapi_key = os.getenv("NEW_NEWS_API_KEY") or os.getenv("NEWS_API_KEY_2")
+        # Added Finnhub token fallback as a free alternative for the economic calendar
+        self.finnhub_key = os.getenv("FINNHUB_API_KEY") 
 
     def fetch_high_impact_events(self) -> list:
         """
-        Fetches high-impact economic indicators from FMP and verifies them 
-        using a dual Authority/Keyword matrix framework.
+        Fetches high-impact economic indicators. Swapped to Finnhub as an alternative
+        since FMP's economic calendar returns a 403 error on the Free Plan.
         """
-        if not self.fmp_key:
-            logger.error("FMP_API_KEY is missing. Skipping economic calendar aggregation.")
+        if not self.finnhub_key:
+            logger.warning("FINNHUB_API_KEY missing. Skipping free economic calendar stream to prevent FMP 403 blocks.")
             return []
             
-        url = "https://financialmodelingprep.com/api/v3/economic_calendar"
-        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        params = {
-            "apikey": self.fmp_key,
-            "from": today_str,
-            "to": today_str
-        }
+        # Finnhub provides a free economic calendar endpoint
+        url = "https://finnhub.io/api/v1/calendar/economic"
+        params = {"token": self.finnhub_key}
         
         try:
             response = requests.get(url, params=params, timeout=10)
             if response.status_code != 200:
-                logger.error(f"FMP Economic Calendar API returned status code {response.status_code}")
+                logger.error(f"Finnhub Calendar API returned status code {response.status_code}")
                 return []
                 
             vetted_events = []
-            for event in response.json():
-                # Primary filter: Trust FMP's high impact classification metadata
-                if event.get("impact") != "High":
+            # Finnhub wraps data inside an 'economicCalendar' array
+            events = response.json().get("economicCalendar", [])
+            
+            for event in events:
+                # Finnhub impact uses integer rating matrix scales or strings. Filter high-impact:
+                # Typically, Finnhub uses 1-3 stars or 'high' strings depending on version.
+                impact = str(event.get("impact", "")).lower()
+                if "high" not in impact and impact != "3":
                     continue
                     
+                # Standardize to your existing architecture 
                 currency = event.get("currency")
                 if currency not in ["USD", "EUR", "GBP"]:
                     continue
                     
                 name = event.get("event") or ""
                 country = event.get("country") or ""
-                
-                # Broad text matching context evaluation
                 text = f"{name} {country}".lower()
                 
-                # Check for either specific institutional authority OR matching macro indicators
                 is_authorized = (
                     any(src.lower() in text for src in AUTHORITY_SOURCES) or
                     any(keyword in text for keyword in AUTHORIZED_KEYWORDS)
@@ -78,14 +79,15 @@ class NewsCalendarClient:
                 if not is_authorized:
                     continue
 
-                date_str = event.get("date")
+                date_str = event.get("time") # Finnhub uses 'time' key for execution timestamps
                 try:
-                    scheduled_time = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    # Finnhub time strings typically map natively via ISO format parsers
+                    scheduled_time = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
                 except Exception:
                     continue
 
                 vetted_events.append({
-                    "id": f"fmp_cal_{name}_{date_str}".replace(" ", "_"),
+                    "id": f"free_cal_{name}_{date_str}".replace(" ", "_"),
                     "type": "economic_calendar",
                     "title": name,
                     "currency": currency,
@@ -97,19 +99,30 @@ class NewsCalendarClient:
             return vetted_events
             
         except Exception as e:
-            logger.error(f"FMP Economic Calendar error: {e}")
+            logger.error(f"Economic Calendar fallback aggregation error: {e}")
             return []
 
     def fetch_fmp_news(self) -> list:
-        """Fetches real-time market news from Financial Modeling Prep."""
+        """Fetches real-time market news from Financial Modeling Prep using Free Tier rules."""
         if not self.fmp_key:
             return []
-        url = f"https://financialmodelingprep.com/api/v3/fmp/articles?page=0&size=5&apikey={self.fmp_key}"
+            
+        # Cleaned URL up for FMP Free Tier compatibility, avoiding nested server-side page structures
+        url = "https://financialmodelingprep.com/api/v3/fmp/articles"
+        params = {
+            "limit": 5,
+            "apikey": self.fmp_key
+        }
         try:
-            res = requests.get(url, timeout=8)
+            res = requests.get(url, params=params, timeout=8)
             if res.status_code != 200:
+                logger.debug(f"FMP Articles returned {res.status_code}. Might be limited on free accounts.")
                 return []
-            articles = res.json().get("content", [])
+                
+            # Free tier direct response payload arrays vs paginated objects
+            data = res.json()
+            articles = data if isinstance(data, list) else data.get("content", [])
+            
             events = []
             for art in articles:
                 title = art.get("title", "")
@@ -146,7 +159,7 @@ class NewsCalendarClient:
                 })
             return events
         except Exception as e:
-            logger.error(f"FMP error: {e}")
+            logger.error(f"FMP News Processing error: {e}")
             return []
 
     def fetch_newsapi_signals(self) -> list:
