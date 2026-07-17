@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI
 from news_client import NewsCalendarClient
@@ -12,10 +13,6 @@ logger = logging.getLogger("NewsEngine")
 MAX_ALLOWED_SPREAD_PIPS = float(os.getenv("MAX_ALLOWED_SPREAD_PIPS", "3.0"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-# Initialize FastAPI app for external verification and keep-alive pings
-app = FastAPI()
-engine_instance = None
 
 class NewsStateEngine:
     def __init__(self):
@@ -36,33 +33,28 @@ class NewsStateEngine:
             logger.error(f"Telegram failed: {e}")
 
     async def collect_all_sources(self):
-        """Polls multiple structural and unstructured sources to find matching active vectors."""
         all_vetted = []
         
-        # 1. Structural Calendar Releases
         calendar_events = self.client.fetch_high_impact_events()
         now = datetime.now(timezone.utc)
         for e in calendar_events:
             if e["scheduled_time"] > now and e["id"] not in self.processed_event_ids:
                 all_vetted.append(e)
 
-        # 2. FMP Breaking Aggregations
         fmp_events = self.client.fetch_fmp_news()
         for e in fmp_events:
             if e["id"] not in self.processed_event_ids:
                 all_vetted.append(e)
 
-        # 3. NewsAPI Global Headlines
         newsapi_events = self.client.fetch_newsapi_signals()
         for e in newsapi_events:
             if e["id"] not in self.processed_event_ids:
                 all_vetted.append(e)
 
-        self.active_events = pdf = all_vetted
+        self.active_events = all_vetted
         logger.info(f"Aggregated Queue Sync: {len(self.active_events)} unprocessed events pending.")
 
     async def process_breaking_news(self, event: dict):
-        """Handles immediate algorithmic processing for unstructured FMP or NewsAPI signals."""
         eid = event["id"]
         title = event["title"]
         currency = event["currency"]
@@ -99,7 +91,6 @@ class NewsStateEngine:
             seconds_remaining = (scheduled_time - now).total_seconds()
 
             if seconds_remaining <= 0.5:
-                # T-0 logic (Unchanged execution validation block)
                 direction = "CALL" if event["forecast"] > event["previous"] else "PUT"
                 execution_msg = (
                     f"🚀 *CALENDAR NEWS EXECUTION TRIGGERED*\n\n"
@@ -118,7 +109,6 @@ class NewsStateEngine:
         self.processed_event_ids.add(event_id)
 
     async def run_master_loop(self):
-        """High-frequency continuous collection engine loop."""
         while True:
             try:
                 await self.collect_all_sources()
@@ -132,23 +122,26 @@ class NewsStateEngine:
                 if active_tasks:
                     await asyncio.gather(*active_tasks)
 
-                # Poll everything every 20 minutes to keep finding news signals
                 await asyncio.sleep(1200)
             except Exception as e:
                 logger.error(f"Error in Master Loop: {e}")
                 await asyncio.sleep(60)
 
-@app.on_event("startup")
-async def startup_event():
+engine_instance = None
+
+# Using the modern lifespan context manager pattern to silence deprecation warnings
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global engine_instance
     engine_instance = NewsStateEngine()
-    # Run the continuous processing background task alongside the server
     asyncio.create_task(engine_instance.run_master_loop())
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/cron")
 @app.get("/health")
 def keep_alive_endpoint():
-    """Target URL for external cronjob engines to prevent service sleep"""
     return {
         "status": "active",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -157,6 +150,5 @@ def keep_alive_endpoint():
 
 if __name__ == "__main__":
     import uvicorn
-    # Render binds dynamic platform ports directly to the PORT variable
     port = int(os.getenv("PORT", "10000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
