@@ -15,65 +15,79 @@ AUTHORITY_SOURCES = [
 
 class NewsCalendarClient:
     def __init__(self, api_key: str = None, news_source: str = None):
+        # Retain references to maintain constructor backwards compatibility
         self.api_key = api_key or os.getenv("JBLANKED_API_KEY")
         self.news_source = news_source or os.getenv("NEWS_SOURCE", "forex-factory")
         self.fmp_key = os.getenv("FMP_API_KEY")
         self.newsapi_key = os.getenv("NEW_NEWS_API_KEY") or os.getenv("NEWS_API_KEY_2")
-        
-        self.base_url = f"https://www.jblanked.com/news/api/{self.news_source}/calendar/today/"
 
     def fetch_high_impact_events(self) -> list:
-        """Fetches structured economic events from JBlanked."""
-        if not self.api_key:
+        """
+        Pivots from JBlanked to Financial Modeling Prep's Economic Calendar API.
+        Extracts high-impact economic indicators for the active calendar date.
+        """
+        if not self.fmp_key:
+            logger.error("FMP_API_KEY is missing. Skipping economic calendar aggregation.")
             return []
-        headers = {"Content-Type": "application/json", "Authorization": f"Api-Key {self.api_key}"}
-        try:
-            response = requests.get(self.base_url, headers=headers, timeout=8)
-            if response.status_code != 200:
-                logger.error(f"JBlanked API returned status code {response.status_code}")
-                return []
             
+        url = "https://financialmodelingprep.com/stable/economic-calendar"
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        params = {
+            "apikey": self.fmp_key,
+            "from": today_str,
+            "to": today_str
+        }
+        
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            if response.status_code != 200:
+                logger.error(f"FMP Economic Calendar API returned status code {response.status_code}")
+                return []
+                
             vetted_events = []
             for event in response.json():
-                impact = event.get("Impact") or event.get("impact")
+                # Filter down strictly to High impact to match risk profile
+                impact = event.get("impact")
                 if impact != "High":
                     continue
-                currency = event.get("Currency") or event.get("currency")
+                    
+                # Limit tracking to tradeable target pairs
+                currency = event.get("currency")
                 if currency not in ["USD", "EUR", "GBP"]:
                     continue
                     
-                name = event.get("Name") or event.get("name") or ""
-                category = event.get("Category") or event.get("category") or ""
+                name = event.get("event") or ""
+                country = event.get("country") or ""
                 
-                is_authorized = any(src.lower() in name.lower() or src.lower() in category.lower() for src in AUTHORITY_SOURCES)
+                # Check for authority credentials or critical core high-volatility keywords
+                is_authorized = any(src.lower() in name.lower() or src.lower() in country.lower() for src in AUTHORITY_SOURCES)
                 if not is_authorized and any(kw in name.lower() for kw in ["rate", "fomc", "cpi", "nfp", "gdp"]):
                     is_authorized = True
                     
                 if not is_authorized:
                     continue
 
-                date_str = event.get("Date") or event.get("date")
+                # Parse FMP format: "YYYY-MM-DD HH:MM:SS"
+                date_str = event.get("date")
                 try:
-                    scheduled_time = datetime.fromisoformat(date_str.replace(".", "-")).replace(tzinfo=timezone.utc)
+                    scheduled_time = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
                 except Exception:
-                    try:
-                        scheduled_time = datetime.strptime(date_str, "%Y.%m.%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                    except Exception:
-                        continue
+                    continue
 
                 vetted_events.append({
-                    "id": str(event.get("ID") or name),
+                    "id": f"fmp_cal_{name}_{date_str}".replace(" ", "_"),
                     "type": "economic_calendar",
                     "title": name,
                     "currency": currency,
                     "scheduled_time": scheduled_time,
-                    "forecast": self._clean_numeric_value(event.get("Forecast")),
-                    "previous": self._clean_numeric_value(event.get("Previous")),
+                    "forecast": self._clean_numeric_value(event.get("estimate")),
+                    "previous": self._clean_numeric_value(event.get("previous")),
                     "deviation_threshold": self._determine_threshold(name)
                 })
             return vetted_events
+            
         except Exception as e:
-            logger.error(f"JBlanked error: {e}")
+            logger.error(f"FMP Economic Calendar error: {e}")
             return []
 
     def fetch_fmp_news(self) -> list:
