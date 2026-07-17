@@ -61,7 +61,12 @@ class NewsStateEngine:
         sentiment = event["sentiment"]
         
         trade_pair = f"{currency}/USD" if currency != "USD" else "EUR/USD"
-        direction = "CALL" if sentiment == 1 else "PUT"
+        
+        # If the asset is USD, positive sentiment drops EUR/USD (PUT). Otherwise, it climbs (CALL).
+        if currency == "USD":
+            direction = "PUT" if sentiment == 1 else "CALL"
+        else:
+            direction = "CALL" if sentiment == 1 else "PUT"
         
         execution_msg = (
             f"⚡ *BREAKING DATA SIGNAL INSTANT TRIGGER*\n\n"
@@ -91,7 +96,12 @@ class NewsStateEngine:
             seconds_remaining = (scheduled_time - now).total_seconds()
 
             if seconds_remaining <= 0.5:
-                direction = "CALL" if event["forecast"] > event["previous"] else "PUT"
+                # If USD forecast is higher, it strengthens USD and drops EUR/USD (PUT).
+                if currency == "USD":
+                    direction = "PUT" if event["forecast"] > event["previous"] else "CALL"
+                else:
+                    direction = "CALL" if event["forecast"] > event["previous"] else "PUT"
+                    
                 execution_msg = (
                     f"🚀 *CALENDAR NEWS EXECUTION TRIGGERED*\n\n"
                     f"Action: *{direction}*\n"
@@ -129,7 +139,6 @@ class NewsStateEngine:
 
 engine_instance = None
 
-# Using the modern lifespan context manager pattern to silence deprecation warnings
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global engine_instance
@@ -139,13 +148,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-
 @app.get("/")
 def root_endpoint():
     """Default landing route to satisfy standard platform health checks"""
     return {"status": "online", "service": "Forex News Signal Engine"}
-
-
 
 @app.get("/cron")
 @app.get("/health")
